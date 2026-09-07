@@ -575,6 +575,7 @@ mod tests {
     /// The whole subprocess path, against a stub that records how it was
     /// called: the provider filter has to reach omp, and the report has to come
     /// back parsed.
+    #[cfg(unix)]
     #[test]
     fn the_cli_is_called_for_one_provider_and_its_report_is_parsed() {
         let dir = tempfile::tempdir().unwrap();

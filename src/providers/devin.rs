@@ -247,8 +247,8 @@ fn devin_data_dir() -> Result<PathBuf> {
             return Ok(xdg.join("devin"));
         }
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/devin"))
+    let home = crate::platform::home_dir().context("home directory is not set")?;
+    Ok(home.join(".local/share/devin"))
 }
 
 fn devin_config_dir() -> Result<PathBuf> {
@@ -258,8 +258,8 @@ fn devin_config_dir() -> Result<PathBuf> {
             return Ok(xdg.join("devin"));
         }
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config/devin"))
+    let home = crate::platform::home_dir().context("home directory is not set")?;
+    Ok(home.join(".config/devin"))
 }
 
 /// Read `agent.model` from `~/.config/devin/config.json` (or `$XDG_CONFIG_HOME`).
@@ -1015,13 +1015,17 @@ mod tests {
 
     #[test]
     fn credentials_path_falls_back_to_home() {
+        // Pin HOME to a tempdir rather than reading the real one, so the
+        // assertion also holds on Windows where HOME is normally unset.
+        let dir = tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
         std::env::remove_var("XDG_DATA_HOME");
         std::env::remove_var("DEVIN_CREDENTIALS_FILE");
-        let home = std::env::var_os("HOME").expect("HOME");
         let resolved = auth_path().expect("path");
+        std::env::remove_var("HOME");
         assert_eq!(
             resolved,
-            PathBuf::from(home).join(".local/share/devin/credentials.toml")
+            dir.path().join(".local/share/devin/credentials.toml")
         );
     }
 

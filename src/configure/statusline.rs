@@ -61,8 +61,8 @@ impl Adapter {
                 .with_context(|| format!("write {} statusLine backup", self.label))?;
         }
         let wrapper_command = format!(
-            "HERDR_PLUGIN_STATE_DIR={} {} {}",
-            shell_quote(state),
+            "{}{} {}",
+            crate::platform::env_prefix("HERDR_PLUGIN_STATE_DIR", state),
             shell_quote(executable),
             self.subcommand
         );
@@ -164,10 +164,16 @@ impl Adapter {
         else {
             return Ok(None);
         };
-        let Some(rest) = command.strip_prefix("HERDR_PLUGIN_STATE_DIR='") else {
-            return Ok(None);
+        // The wrapper is written in the platform shell's syntax: a POSIX
+        // env-var prefix, or `cmd.exe`'s quoted `set ... &&`.
+        let state = if let Some(rest) = command.strip_prefix("HERDR_PLUGIN_STATE_DIR='") {
+            rest.split_once("' ").map(|(state, _)| state)
+        } else if let Some(rest) = command.strip_prefix("set \"HERDR_PLUGIN_STATE_DIR=") {
+            rest.split_once("\" && ").map(|(state, _)| state)
+        } else {
+            None
         };
-        let Some((old_state, _)) = rest.split_once("' ") else {
+        let Some(old_state) = state else {
             return Ok(None);
         };
         let backup = Path::new(old_state).join(self.backup_file);
@@ -194,8 +200,8 @@ pub(crate) fn settings_path(environment: &str, relative: &str) -> Result<PathBuf
     if let Some(path) = std::env::var_os(environment) {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(relative))
+    let home = crate::platform::home_dir().context("home directory is not set")?;
+    Ok(home.join(relative))
 }
 
 fn read_settings(path: &Path, label: &str) -> Result<Value> {
@@ -221,5 +227,5 @@ fn write_settings(path: &Path, settings: &Value, label: &str) -> Result<()> {
 }
 
 fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    crate::platform::shell_quote(path)
 }

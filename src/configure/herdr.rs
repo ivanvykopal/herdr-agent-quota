@@ -208,8 +208,18 @@ pub fn config_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("HERDR_CONFIG_FILE") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config/herdr/config.toml"))
+    // Herdr keeps its own config in the XDG config directory on Unix and in
+    // %APPDATA% on Windows. Follow that layout so the rows land in the file
+    // the running server actually reads.
+    if cfg!(windows) {
+        let config = directories::BaseDirs::new()
+            .context("resolve the Windows config directory")?
+            .config_dir()
+            .to_path_buf();
+        return Ok(config.join("herdr").join("config.toml"));
+    }
+    let home = crate::platform::home_dir().context("home directory is not set")?;
+    Ok(home.join(".config/herdr/config.toml"))
 }
 
 fn backup_path() -> Result<Option<PathBuf>> {

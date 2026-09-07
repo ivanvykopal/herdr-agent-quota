@@ -1,3 +1,8 @@
+// The whole harness drives a `#!/bin/sh` Herdr stub and a perl lock helper,
+// neither of which exists on Windows. Unix CI runs it; the behavior it pins
+// is platform-independent.
+#![cfg(unix)]
+
 use herdr_agent_quota::cache::CacheStore;
 use herdr_agent_quota::configure::herdr::{add_quota_row, remove_quota_row};
 use herdr_agent_quota::model::{Provider, ProviderSnapshot, UsageWindow, WindowKind};

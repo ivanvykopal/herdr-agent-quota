@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -10,7 +10,12 @@ use std::time::Duration;
 use std::os::unix::process::CommandExt;
 
 /// A statusLine command must never consume the refresh interval itself.
-pub const STATUSLINE_COMMAND_BUDGET: Duration = Duration::from_secs(2);
+///
+/// The chained collector is a user-owned command and can be as slow as
+/// `npx -y something@latest`, which re-resolves the package over the network
+/// on every invocation (observed at ~5s on Windows). The budget covers that
+/// while staying well under the shortest refresh interval Claude offers.
+pub const STATUSLINE_COMMAND_BUDGET: Duration = Duration::from_secs(15);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -30,9 +35,8 @@ pub fn run_shell_with_deadline(
     input: &[u8],
     budget: Duration,
 ) -> Result<CommandOutput> {
-    let mut child = Command::new("sh");
+    let mut child = crate::platform::shell_command(command);
     child
-        .args(["-c", command])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -102,6 +106,8 @@ fn terminate_and_reap(child: &Mutex<Option<Child>>) -> Result<Option<ExitStatus>
         // setpgid in the child setup makes this include shell descendants.
         let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
+    #[cfg(windows)]
+    crate::platform::kill_process_tree(&child);
     let _ = child.kill();
     child.wait().map(Some).context("reap previous statusLine")
 }
@@ -113,18 +119,29 @@ mod tests {
 
     #[test]
     fn captures_a_completed_command() {
-        let result =
-            run_shell_with_deadline("printf done", b"ignored", Duration::from_secs(1)).unwrap();
-        assert_eq!(result.stdout, b"done");
+        // `sh -c` and `cmd /S /C` agree on `echo`; `printf` without a
+        // newline is the exact-output check for the POSIX side.
+        let (command, expected) = if cfg!(windows) {
+            ("echo done", "done\r\n")
+        } else {
+            ("printf done", "done")
+        };
+        let result = run_shell_with_deadline(command, b"ignored", Duration::from_secs(5)).unwrap();
+        assert_eq!(result.stdout, expected.as_bytes());
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
     }
 
     #[test]
     fn kills_a_command_that_exceeds_its_budget() {
+        let command = if cfg!(windows) {
+            // cmd has no `sleep`; a long ping is the standard stand-in.
+            "ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "sleep 20 & wait"
+        };
         let started = Instant::now();
-        let result =
-            run_shell_with_deadline("sleep 20 & wait", b"", Duration::from_millis(100)).unwrap();
+        let result = run_shell_with_deadline(command, b"", Duration::from_millis(100)).unwrap();
         assert!(result.timed_out);
         assert!(started.elapsed() < Duration::from_secs(1));
     }

@@ -129,6 +129,34 @@ impl CacheStore {
         .context("write refresh marker")
     }
 
+    /// Record a session's model without touching anything else in the snapshot.
+    ///
+    /// The transcript's served model is the ground truth, so an existing entry
+    /// is replaced. The gateway marker is insert-only: once a session is proven
+    /// gateway-routed it stays that way for its lifetime.
+    pub fn record_session_model(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        model: String,
+        gateway_routed: bool,
+    ) -> Result<()> {
+        self.ensure()?;
+        let mut snapshot = self.load(provider)?.ok_or_else(|| {
+            anyhow::anyhow!("no {provider:?} snapshot to record a session model into")
+        })?;
+        snapshot
+            .session_models
+            .insert(session_id.to_string(), model);
+        if gateway_routed {
+            snapshot
+                .session_gateway_routed
+                .entry(session_id.to_string())
+                .or_insert(());
+        }
+        self.save(&snapshot)
+    }
+
     pub fn save(&self, snapshot: &ProviderSnapshot) -> Result<()> {
         self.ensure()?;
         let destination = self.snapshot_path(snapshot.provider);
@@ -803,6 +831,12 @@ fn merge_session_models(
                 .entry(session_id.clone())
                 .or_insert_with(|| model.clone());
         }
+        for session_id in previous.session_gateway_routed.keys() {
+            snapshot
+                .session_gateway_routed
+                .entry(session_id.clone())
+                .or_insert(());
+        }
     }
     let Some(session_id) = session_id else {
         return;
@@ -988,6 +1022,7 @@ fn prune_session_diagnostics(snapshot: &mut ProviderSnapshot, current_session_id
     prune_session_map(&mut snapshot.session_contexts, current_session_ids);
     prune_session_map(&mut snapshot.session_windows, current_session_ids);
     prune_session_map(&mut snapshot.session_quota_scopes, current_session_ids);
+    prune_session_map(&mut snapshot.session_gateway_routed, current_session_ids);
     snapshot.quota_scope_windows.retain(|scope, _| {
         snapshot
             .session_quota_scopes

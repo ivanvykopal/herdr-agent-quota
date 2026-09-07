@@ -93,16 +93,16 @@ fn opencode_cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(PathBuf::from(xdg).join("opencode"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache/opencode"))
+    let home = crate::platform::home_dir()?;
+    Some(home.join(".cache/opencode"))
 }
 
 fn opencode_data_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         return Some(PathBuf::from(xdg).join("opencode"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/share/opencode"))
+    let home = crate::platform::home_dir()?;
+    Some(home.join(".local/share/opencode"))
 }
 
 pub fn env_go_key_present() -> bool {
@@ -588,7 +588,9 @@ mod tests {
     #[test]
     fn database_opens_under_a_path_containing_uri_punctuation() {
         let directory = tempdir().unwrap();
-        let store = directory.path().join("we?ird#dir");
+        // `?` is not a legal Windows filename character; `#` and `%` are
+        // still URI punctuation, which is what this test exercises.
+        let store = directory.path().join("we#ird%dir");
         fs::create_dir_all(&store).unwrap();
         write_fixture_db(
             &store.join("opencode.db"),

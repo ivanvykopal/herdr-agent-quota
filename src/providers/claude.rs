@@ -5,6 +5,8 @@ use crate::providers::ProviderError;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 /// Opaque Claude profile identity used to share quota across sessions.
@@ -225,6 +227,111 @@ pub fn run_statusline(input: &[u8]) -> std::result::Result<ProviderSnapshot, Pro
     parse_statusline(&value, CacheStore::now_unix())
 }
 
+/// The model the gateway actually served for a session, from its transcript.
+///
+/// A gateway-routed Claude Code still reports the logical selection in
+/// statusLine `model.display_name` ("Opus 4.8"), while the transcript records
+/// the served model on every assistant turn (`message.model`: "glm-5.3").
+/// The transcript is the local ground truth, so the last assistant turn's
+/// model wins over the declared name.
+///
+/// Reads only the tail of the file: the newest entry carries the current
+/// model, so scanning the whole transcript is wasted work.
+pub(crate) fn transcript_model(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(TRANSCRIPT_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    let mut window = tail.as_slice();
+    if start > 0 {
+        // Drop a partial line cut by the tail boundary.
+        if let Some(index) = window.iter().position(|byte| *byte == b'\n') {
+            window = &window[index + 1..];
+        } else {
+            window = &[];
+        }
+    }
+    let mut model = None;
+    for line in window.split(|byte| *byte == b'\n') {
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        // The `model` attachment lands with the first prompt, before any
+        // assistant turn; the assistant entries confirm or update it after.
+        if entry.get("type").and_then(Value::as_str) == Some("attachment")
+            && entry.pointer("/attachment/type").and_then(Value::as_str) == Some("model")
+        {
+            if let Some(declared) = entry
+                .pointer("/attachment/identity/modelId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                model = Some(declared.to_string());
+            }
+        }
+        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(served) = entry
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            model = Some(served.to_string());
+        }
+    }
+    model
+}
+
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Whether a served model id was served by Anthropic itself.
+///
+/// Anthropic model ids start with `claude-` (e.g. `claude-opus-4-8`,
+/// `claude-glm-alias` is not a thing: gateways keep their own ids). A gateway
+/// that aliases its models as `claude-*` is indistinguishable from direct
+/// serving, and that is acceptable — its quota is genuinely unknown either
+/// way, and showing the profile's windows is the long-standing behavior.
+pub(crate) fn is_anthropic_model_id(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("claude-")
+}
+
+/// Locate the transcript for a session by id under the profile root.
+///
+/// Sessions live in `<config dir>/projects/<munged cwd>/<session-id>.jsonl`.
+/// The munged cwd cannot be reconstructed from the pane data (its casing is
+/// not stable), so every project directory is scanned for a file named after
+/// the session. A session id containing a path separator would escape the
+/// scan, so it is rejected up front.
+pub(crate) fn transcript_for_session(
+    claude_config_dir: Option<&OsStr>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if session_id.contains(['/', '\\']) {
+        return None;
+    }
+    let config_dir = match claude_config_dir.filter(|value| !value.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => crate::platform::home_dir()?.join(".claude"),
+    };
+    let projects = config_dir.join("projects");
+    let filename = format!("{session_id}.jsonl");
+    let candidates = std::fs::read_dir(&projects).ok()?;
+    for entry in candidates.flatten() {
+        let path = entry.path().join(&filename);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +516,99 @@ mod tests {
     #[test]
     fn rejects_non_json_statusline_input() {
         assert!(run_statusline(b"not-json").is_err());
+    }
+
+    #[test]
+    fn transcript_model_reports_the_last_served_model() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            concat!(
+                r#"{"type":"user","message":{"role":"user"},"content":"hi"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"model":"glm-5.3","role":"assistant"}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"model":"kimi-k3","role":"assistant"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_model(transcript.path()).as_deref(),
+            Some("kimi-k3")
+        );
+    }
+
+    #[test]
+    fn transcript_model_ignores_non_assistant_models() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            concat!(
+                r#"{"type":"assistant","message":{"model":"glm-5.3"}}"#,
+                "\n",
+                r#"{"type":"summary","model":"not-a-model"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_model(transcript.path()).as_deref(),
+            Some("glm-5.3")
+        );
+    }
+
+    #[test]
+    fn an_assistant_turn_overrides_the_declared_attachment() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            concat!(
+                r#"{"type":"attachment","attachment":{"type":"model","identity":{"modelId":"kimi-k3"}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"model":"glm-5.3"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_model(transcript.path()).as_deref(),
+            Some("glm-5.3")
+        );
+    }
+
+    #[test]
+    fn transcript_for_session_scans_project_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".claude");
+        let project = config.join("projects").join("C--Users-me-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("session-1.jsonl"),
+            r#"{"type":"assistant","message":{"model":"glm-5.3"}}"#,
+        )
+        .unwrap();
+        let path = transcript_for_session(Some(config.as_os_str()), "session-1");
+        assert_eq!(
+            path.as_deref(),
+            Some(project.join("session-1.jsonl").as_path())
+        );
+    }
+
+    #[test]
+    fn transcript_for_session_rejects_path_shaped_ids() {
+        assert!(transcript_for_session(None, "../escape").is_none());
+        assert!(transcript_for_session(None, r"..\escape").is_none());
+    }
+
+    #[test]
+    fn gateway_models_are_distinguished_from_anthropic_ids() {
+        assert!(is_anthropic_model_id("claude-opus-4-8"));
+        assert!(is_anthropic_model_id("Claude-Sonnet-4-5"));
+        assert!(!is_anthropic_model_id("glm-5.3"));
+        assert!(!is_anthropic_model_id("kimi-k3"));
+        assert!(!is_anthropic_model_id(""));
     }
 
     #[test]

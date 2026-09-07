@@ -22,6 +22,7 @@ use std::os::unix::process::CommandExt;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
+const MONTHLY_WINDOW_MINUTES: u64 = 30 * 24 * 60;
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
 const ROLLOUT_HEAD_BYTES: u64 = 256 * 1024;
 const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
@@ -126,6 +127,12 @@ fn window_kind(duration_minutes: u64) -> Option<WindowKind> {
         Some(WindowKind::FiveHour)
     } else if duration_minutes.abs_diff(WEEKLY_WINDOW_MINUTES) <= 180 {
         Some(WindowKind::Weekly)
+    } else if duration_minutes.abs_diff(MONTHLY_WINDOW_MINUTES) <= 4 * 24 * 60 {
+        // ChatGPT's free plan reports a single monthly window
+        // (`windowDurationMins` = 43200) with no 5h or weekly sibling. The
+        // tolerance spans the 28–31 day calendar months a paid plan may
+        // instead report so the long-quota row is never dropped.
+        Some(WindowKind::Monthly)
     } else {
         None
     }
@@ -143,22 +150,7 @@ fn parse_reset(value: &Value) -> Option<ResetAt> {
 /// behind the bounded `thread/list` page.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     let executable = std::env::var_os("CODEX_BIN_PATH").unwrap_or_else(|| "codex".into());
-    let mut command = Command::new(executable);
-    command
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().context("start codex app-server")?;
+    let mut child = spawn_app_server(&executable).context("start codex app-server")?;
     let mut input = child.stdin.take().context("open codex app-server stdin")?;
     let stdout = child
         .stdout
@@ -181,6 +173,67 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     result
 }
 
+/// Start `codex app-server --stdio` with piped stdio.
+///
+/// On Windows a direct spawn can fail because npm installs the Codex CLI as
+/// a `.cmd` shim, which cannot be executed without a shell. When that
+/// happens the server is started through `cmd`, which resolves the shim.
+fn spawn_app_server(executable: &std::ffi::OsStr) -> std::io::Result<std::process::Child> {
+    let mut command = Command::new(executable);
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        #[cfg(windows)]
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            // Windows resolves a bare `codex` to npm's extensionless shell
+            // shim and refuses to execute it (or the `.cmd` twin) directly;
+            // `cmd` runs either one.
+            spawn_via_cmd(executable)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Run the app-server through `cmd`, which can execute npm's `.cmd` shims.
+///
+/// `raw_arg` keeps the quotes intact — normal argv quoting would escape
+/// them C-style, which `cmd` cannot parse.
+#[cfg(windows)]
+fn spawn_via_cmd(executable: &std::ffi::OsStr) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = Command::new("cmd");
+    command.raw_arg("/S");
+    command.raw_arg("/C");
+    command.raw_arg(format!(
+        "{} app-server --stdio",
+        crate::platform::shell_quote(std::path::Path::new(executable))
+    ));
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command.spawn()
+}
+
 /// Kill the app-server's process group and reap it, at most once.
 ///
 /// Whichever of the request thread and the watchdog gets here first takes the
@@ -198,6 +251,8 @@ fn terminate(child: &Mutex<Option<Child>>) {
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
+    #[cfg(windows)]
+    crate::platform::kill_process_tree(&child);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -673,8 +728,7 @@ pub fn auth_path() -> Result<PathBuf> {
 }
 
 fn codex_home() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let home = PathBuf::from(home);
+    let home = crate::platform::home_dir().context("home directory is not set")?;
     Ok(std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex")))
@@ -777,6 +831,22 @@ mod tests {
         let snapshot = parse_rate_limits(&value, 1).unwrap();
         assert_eq!(snapshot.windows.len(), 1);
         assert!(snapshot.window(WindowKind::FiveHour).is_some());
+    }
+
+    #[test]
+    fn parses_the_free_plan_monthly_window() {
+        // ChatGPT's free plan reports a single 30-day (`43200`) window with a
+        // null secondary; earlier builds dropped it and stored no snapshot.
+        let value = json!({"result": {"rateLimits": {
+            "primary": {"usedPercent": 100.0, "windowDurationMins": 43200, "resetsAt": 1789049413},
+            "secondary": null
+        }}});
+        let snapshot = parse_rate_limits(&value, 1).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(
+            snapshot.window(WindowKind::Monthly).unwrap().resets_at,
+            Some(ResetAt::from_unix_seconds(1_789_049_413))
+        );
     }
 
     #[test]

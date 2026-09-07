@@ -599,6 +599,15 @@ pub struct ProviderSnapshot {
     /// stored.
     #[serde(default)]
     pub session_quota_scopes: BTreeMap<String, String>,
+    /// Claude sessions whose transcript shows a non-Anthropic served model.
+    ///
+    /// A gateway-routed session (custom `ANTHROPIC_BASE_URL`) runs on someone
+    /// else's quota; the profile's Anthropic windows belong to the direct
+    /// sessions of the same profile, not to it. The transcript's served model
+    /// id is the discriminator: a `claude-*` model is Anthropic-served,
+    /// anything else (`glm-5.3`, `kimi-k3`, …) is gateway-served.
+    #[serde(default)]
+    pub session_gateway_routed: BTreeMap<String, ()>,
     /// Latest quota windows for a Claude profile scope. Sessions that map to
     /// the same scope share this canonical reading.
     #[serde(default)]
@@ -625,6 +634,7 @@ impl ProviderSnapshot {
             session_contexts: BTreeMap::new(),
             session_windows: BTreeMap::new(),
             session_quota_scopes: BTreeMap::new(),
+            session_gateway_routed: BTreeMap::new(),
             quota_scope_windows: BTreeMap::new(),
             account_id: None,
         }
@@ -688,12 +698,21 @@ impl ProviderSnapshot {
     /// 3. Session has legacy `session_windows` → those (Agy, old cache).
     /// 4. Every keyed map is empty → top-level `windows` (Grok/Codex/Devin
     ///    and a StatusLine cache written before session maps existed).
-    /// 5. Keyed maps exist but this session is unknown → empty. A missing
-    ///    session must not borrow another account's numbers.
+    /// 5. Session unknown, but exactly one profile scope has quota → that
+    ///    scope's windows. One scope means one account on this machine, so an
+    ///    unrecorded pane provably belongs to it (a freshly started pane, or
+    ///    one Herdr names before its first StatusLine hook run).
+    /// 6. Session unknown and two or more scopes exist → empty. The account is
+    ///    ambiguous and a missing session must not borrow another's numbers.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
         let Some(session_id) = session_id else {
             return &self.windows;
         };
+        // A gateway-routed session has no Anthropic quota: the profile's
+        // windows are another account's numbers and must not be shown.
+        if self.session_gateway_routed.contains_key(session_id) {
+            return &[];
+        }
         if let Some(scope) = self.session_quota_scopes.get(session_id) {
             if let Some(windows) = self.quota_scope_windows.get(scope) {
                 return windows;
@@ -707,6 +726,19 @@ impl ProviderSnapshot {
             && self.quota_scope_windows.is_empty()
         {
             return &self.windows;
+        }
+        // A pane whose session the StatusLine collector has not recorded yet
+        // (a freshly started pane, or one whose id Herdr reports before the
+        // first hook run) is unknown to every keyed map. When exactly one
+        // profile scope has quota there is a single account on this machine,
+        // so the pane provably belongs to it: show that account's windows
+        // instead of a bare `N/A`. This is the same account-level sharing the
+        // known same-profile panes already get; with two or more scopes the
+        // account is ambiguous and the conservative empty result stands.
+        if self.quota_scope_windows.len() == 1 {
+            if let Some(windows) = self.quota_scope_windows.values().next() {
+                return windows;
+            }
         }
         &[]
     }
@@ -1544,6 +1576,35 @@ mod tests {
             82.0
         );
         assert!(snapshot.windows_for_session(Some("unknown")).is_empty());
+    }
+
+    #[test]
+    fn an_unrecorded_pane_inherits_the_only_profile_scope_quota() {
+        // A single Anthropic account: one profile scope holds the quota, and
+        // known sessions (any model, including third-party routes) already
+        // share it. A pane whose session the StatusLine collector has not yet
+        // recorded must inherit the same account quota rather than show N/A.
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 1);
+        snapshot
+            .session_quota_scopes
+            .insert("recorded".to_string(), "scope-w".to_string());
+        snapshot.session_windows.insert(
+            "recorded".to_string(),
+            vec![quota_window(WindowKind::Weekly, 27.0, 10_000)],
+        );
+        snapshot.quota_scope_windows.insert(
+            "scope-w".to_string(),
+            vec![quota_window(WindowKind::Weekly, 27.0, 10_000)],
+        );
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("not-yet-recorded"))
+                .first()
+                .unwrap()
+                .used_percent,
+            27.0
+        );
     }
 
     #[test]

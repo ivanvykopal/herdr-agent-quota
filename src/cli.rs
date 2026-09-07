@@ -122,6 +122,9 @@ pub enum Command {
     },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
+    /// Open the plugin's settings pane. Invoked by the plugin's
+    /// open-settings action; not for manual use.
+    OpenSettings,
     /// Claude statusLine hook. Claude Code invokes this; not for manual use.
     ClaudeStatusline,
     /// Agy statusLine hook. Antigravity invokes this; not for manual use.

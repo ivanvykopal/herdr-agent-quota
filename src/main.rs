@@ -32,22 +32,33 @@ fn main() -> Result<()> {
             brand_colors,
             agent_order,
             low_quota_alert,
-        } => herdr_agent_quota::configure::run(
-            check,
-            apply,
-            uninstall,
-            &herdr_agent_quota::cli::AgentSelection::from_args_or_env(&agent),
-            herdr_agent_quota::cli::ConfigureOptions {
-                watch_interval_seconds,
-                sidebar_layout,
-                quota_percent,
-                row_gap,
-                fields,
-                brand_colors,
-                agent_order,
-                low_quota_alert,
-            },
-        ),
+        } => {
+            let result = herdr_agent_quota::configure::run(
+                check,
+                apply,
+                uninstall,
+                &herdr_agent_quota::cli::AgentSelection::from_args_or_env(&agent),
+                herdr_agent_quota::cli::ConfigureOptions {
+                    watch_interval_seconds,
+                    sidebar_layout,
+                    quota_percent,
+                    row_gap,
+                    fields,
+                    brand_colors,
+                    agent_order,
+                    low_quota_alert,
+                },
+            );
+            // The plugin's configure action used to chain
+            // `&& herdr server reload-config` through a shell. The command
+            // is platform-neutral argv now, so the reload lives here and
+            // only fires under a Herdr-provided binary.
+            if result.is_ok() && (apply || uninstall) {
+                herdr_agent_quota::herdr::reload_server_config()?;
+            }
+            result
+        }
+        Command::OpenSettings => herdr_agent_quota::herdr::open_settings_pane(),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
         Command::AgyStatusline => herdr_agent_quota::configure::agy::run_statusline_hook(),
     }

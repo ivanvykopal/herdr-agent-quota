@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 const METADATA_TTL_MS: &str = "86400000";
+/// Herdr rejects a metadata report that touches more than this many tokens.
+const METADATA_REPORT_TOKEN_LIMIT: usize = 16;
 const MAX_METADATA_TOKENS: usize = 16;
 /// Every name [`desired_tokens`] can produce, and nothing else.
 ///
@@ -217,24 +219,14 @@ pub fn clear_quota_agent_view() -> Result<()> {
 /// come with `events.subscribe` do not apply.
 ///
 /// Outside Herdr there is no socket and this is a no-op, exactly like
-/// [`crate::prefs::write`], so a direct CLI run still works.
+/// [`crate::prefs::write`], so a direct CLI run still works. On Windows the
+/// transport is a named pipe instead of a Unix-domain socket; the protocol
+/// is the same one request, one reply, one connection.
 fn socket_request(payload: &Value) -> Result<Option<Value>> {
-    use std::io::{BufRead, BufReader, Write};
-
     let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") else {
         return Ok(None);
     };
-    let stream = std::os::unix::net::UnixStream::connect(&path)
-        .with_context(|| format!("connect to Herdr at {}", path.to_string_lossy()))?;
-    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-    let mut writer = &stream;
-    writeln!(writer, "{payload}").context("send Herdr socket request")?;
-    writer.flush().context("flush Herdr socket request")?;
-    let mut line = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut line)
-        .context("read Herdr socket reply")?;
+    let line = socket_request_line(payload, &path)?;
     let reply: Value = serde_json::from_str(&line).context("parse Herdr socket reply")?;
     if let Some(error) = reply.get("error") {
         let message = error
@@ -246,8 +238,126 @@ fn socket_request(payload: &Value) -> Result<Option<Value>> {
     Ok(Some(reply))
 }
 
+/// Send one line-JSON request and return the reply line.
+#[cfg(unix)]
+fn socket_request_line(payload: &Value, path: &std::ffi::OsStr) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(path)
+        .with_context(|| format!("connect to Herdr at {}", path.to_string_lossy()))?;
+    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    let mut writer = &stream;
+    writeln!(writer, "{payload}").context("send Herdr socket request")?;
+    writer.flush().context("flush Herdr socket request")?;
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .context("read Herdr socket reply")?;
+    Ok(line)
+}
+
+/// Windows twin of [`socket_request_line`].
+///
+/// Herdr on Windows serves the same line-JSON protocol over a named pipe
+/// whose name is the socket path, so the client opens
+/// `\\.\pipe\<HERDR_SOCKET_PATH>` read+write. `std::fs::File` has no read
+/// timeout, so the reply is read on a thread bounded by the same budget as
+/// the Unix path; a timed-out thread is abandoned with the pipe open, which
+/// is bounded in turn by the short-lived hook process it runs in.
+#[cfg(windows)]
+fn socket_request_line(payload: &Value, path: &std::ffi::OsStr) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let pipe = format!(r"\\.\pipe\{}", path.to_string_lossy());
+    let payload = payload.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let result = (|| -> Result<String> {
+                let connection = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&pipe)
+                    .with_context(|| format!("connect to Herdr at {pipe}"))?;
+                let mut writer = &connection;
+                writeln!(writer, "{payload}").context("send Herdr socket request")?;
+                writer.flush().context("flush Herdr socket request")?;
+                let mut line = String::new();
+                BufReader::new(connection)
+                    .read_line(&mut line)
+                    .context("read Herdr socket reply")?;
+                Ok(line)
+            })();
+            let _ = sender.send(result);
+        })
+        .context("start Herdr socket reader")?;
+    match receiver.recv_timeout(SOCKET_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("Herdr socket reply timed out after {SOCKET_TIMEOUT:?}"),
+    }
+}
+
 pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
     Ok(list_agent_state()?.panes)
+}
+
+/// Run the running Herdr binary, or nothing outside Herdr.
+fn herdr_command() -> Option<std::process::Command> {
+    let binary = std::env::var_os("HERDR_BIN_PATH")?;
+    let mut command = std::process::Command::new(binary);
+    command.stdin(std::process::Stdio::null());
+    Some(command)
+}
+
+/// Ask the running Herdr server to reload its configuration.
+///
+/// The plugin's configure and uninstall actions used to chain this through
+/// `&& herdr server reload-config` in a shell. Manifest commands are
+/// platform-neutral argv now, so the reload is issued here instead. It only
+/// fires when Herdr launched us as a plugin action — the one context the
+/// shell chain used to run in — so a direct `configure --apply` never
+/// spawns a reload against a stub or missing Herdr binary.
+pub fn reload_server_config() -> Result<()> {
+    if std::env::var_os("HERDR_PLUGIN_ACTION_ID").is_none() {
+        return Ok(());
+    }
+    let Some(mut command) = herdr_command() else {
+        return Ok(());
+    };
+    command
+        .args(["server", "reload-config"])
+        .output()
+        .context("run herdr server reload-config")?;
+    Ok(())
+}
+
+/// Open this plugin's settings pane, for the open-settings action.
+pub fn open_settings_pane() -> Result<()> {
+    let mut command = herdr_command().unwrap_or_else(|| {
+        let mut fallback = std::process::Command::new("herdr");
+        fallback.stdin(std::process::Stdio::null());
+        fallback
+    });
+    let status = command
+        .args([
+            "plugin",
+            "pane",
+            "open",
+            "--plugin",
+            "herdr-agent-quota",
+            "--entrypoint",
+            "settings",
+            "--focus",
+        ])
+        .status()
+        .context("run herdr plugin pane open")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("herdr plugin pane open failed: {status}")
+    }
 }
 
 /// Read Herdr's agent inventory once and derive both panes and working
@@ -504,6 +614,77 @@ pub fn publish_pane_tokens(
         );
     }
     Ok(())
+}
+
+/// Show a pane's agent by name only, clearing every quota token.
+///
+/// Herdr reuses a pane slot when one agent exits and another starts in it.
+/// A pane that becomes an agent this plugin does not collect (for example the
+/// Hermes coding agent) is dropped from the inventory, so the normal publish
+/// pass never revisits it — and any tokens a previous supported agent left in
+/// the slot linger, misattributing the new agent (a Hermes pane still showing
+/// `Codex/…`). The plugin's sidebar row renders the identity through
+/// `quota_provider_model`, so a bare clear would leave the card nameless.
+/// This instead sets the identity to the new agent's own name and clears every
+/// other quota token, so the card reads `Hermes` with no stale usage.
+pub fn report_unsupported_agent(pane_id: &str, display_name: &str, sequence: u64) -> Result<()> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    // The identity keeps the name; every other quota token is cleared. A
+    // single Herdr report may touch at most 16 tokens, so the work is split
+    // across reports, and Herdr ignores a report whose sequence does not
+    // advance, so each report takes the next sequence after the base.
+    let identity = ["quota_provider", "quota_provider_model"];
+    let cleared: Vec<&str> = METADATA_TOKEN_NAMES
+        .into_iter()
+        .chain(OBSOLETE_METADATA_TOKEN_NAMES)
+        .chain(LEGACY_METADATA_TOKEN_NAMES)
+        .filter(|name| !identity.contains(name))
+        .collect();
+
+    let mut seq = sequence;
+    let mut report = |build: &dyn Fn(&mut Command)| -> Result<()> {
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "pane",
+                "report-metadata",
+                pane_id,
+                "--source",
+                "herdr-agent-quota",
+            ])
+            .args(["--seq", &seq.to_string()])
+            .args(["--ttl-ms", METADATA_TTL_MS]);
+        build(&mut command);
+        let output = command.output().context("report agent identity to Herdr")?;
+        if !output.status.success() {
+            anyhow::bail!("Herdr metadata report failed for pane {pane_id}");
+        }
+        seq += 1;
+        Ok(())
+    };
+
+    report(&|command| {
+        command.args(["--token", &format!("quota_provider={display_name}")]);
+        command.args(["--token", &format!("quota_provider_model={display_name}")]);
+    })?;
+    for chunk in cleared.chunks(METADATA_REPORT_TOKEN_LIMIT) {
+        report(&|command| {
+            for name in chunk {
+                command.args(["--clear-token", name]);
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Title-case an `agent` field for display, so `hermes` reads as `Hermes`.
+pub fn agent_display_name(agent: &str) -> String {
+    let trimmed = agent.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn pane_is_scrolled(executable: &std::ffi::OsStr, pane_id: &str) -> bool {
@@ -816,8 +997,34 @@ mod tests {
     };
     use serde_json::json;
 
-    /// Herdr orders an Agent view by the token's own value, so the padding is
-    /// the whole contract: `007` must sort before `042`, and `100` last.
+    #[test]
+    fn agent_display_name_title_cases_an_unsupported_agent() {
+        assert_eq!(agent_display_name("hermes"), "Hermes");
+        assert_eq!(agent_display_name("  hermes  "), "Hermes");
+        assert_eq!(agent_display_name(""), "");
+    }
+
+    /// Live probe against a running Herdr server: set
+    /// `HERDR_AGENT_QUOTA_TEST_SOCKET` to the `herdr.sock` path and run with
+    /// `--ignored`. Verifies the whole socket path on the current platform,
+    /// including the Windows named pipe.
+    #[test]
+    #[ignore = "needs a running Herdr server and HERDR_AGENT_QUOTA_TEST_SOCKET"]
+    fn live_socket_request_round_trips_a_ping() {
+        let path = std::env::var_os("HERDR_AGENT_QUOTA_TEST_SOCKET")
+            .expect("set HERDR_AGENT_QUOTA_TEST_SOCKET to the running server's herdr.sock path");
+        let line = socket_request_line(
+            &json!({"id": "agent-quota:ping", "method": "ping", "params": {}}),
+            &path,
+        )
+        .expect("socket round trip");
+        let reply: Value = serde_json::from_str(&line).expect("reply is JSON");
+        assert_eq!(
+            reply.pointer("/result/type").and_then(Value::as_str),
+            Some("pong")
+        );
+    }
+
     #[test]
     fn the_headroom_token_is_padded_so_its_text_order_is_its_numeric_order() {
         let token = |headroom: Option<u8>| {

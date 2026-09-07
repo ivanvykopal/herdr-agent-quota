@@ -5,17 +5,17 @@ fn pane_focus_uses_the_quota_only_focus_path() {
         .split("[[events]]")
         .find(|event| event.contains("on = \"pane.focused\""))
         .unwrap();
-    assert!(hook.contains(" focus\"]"));
-    assert!(!hook.contains(" event\"]"));
+    assert!(hook.contains(" \"focus\"]"));
+    assert!(!hook.contains(" \"event\"]"));
 }
 
 #[test]
 fn plugin_exposes_one_click_configure_and_uninstall_actions() {
     let manifest = include_str!("../herdr-plugin.toml");
     assert!(manifest.contains("id = \"configure\""));
-    assert!(manifest.contains("configure --apply"));
+    assert!(manifest.contains("\"configure\", \"--apply\""));
     assert!(manifest.contains("id = \"uninstall\""));
-    assert!(manifest.contains("configure --uninstall"));
+    assert!(manifest.contains("\"configure\", \"--uninstall\""));
 }
 
 #[test]
@@ -39,14 +39,15 @@ fn settings_are_an_action_backed_by_a_plugin_pane() {
         .split("[[panes]]")
         .find(|pane| pane.contains("id = \"settings\""))
         .unwrap();
-    assert!(pane.contains(" settings\"]"), "{pane}");
+    assert!(pane.contains("\"settings\""), "{pane}");
     assert!(pane.contains("placement = \"popup\""), "{pane}");
     let action = manifest
         .split("[[actions]]")
         .find(|action| action.contains("id = \"open-settings\""))
         .expect("settings action");
-    assert!(action.contains("plugin pane open"), "{action}");
-    assert!(action.contains("--entrypoint settings"), "{action}");
+    // The action runs the binary's `open-settings` subcommand, which calls
+    // `herdr plugin pane open --entrypoint settings --focus` itself.
+    assert!(action.contains("open-settings"), "{action}");
 }
 
 /// The pane draws one row per option and cannot fold them, so the popup has to

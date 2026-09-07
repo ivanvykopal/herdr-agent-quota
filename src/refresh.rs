@@ -174,11 +174,20 @@ pub fn event() -> Result<()> {
     let Some(agent) = find_agent(event) else {
         return Ok(());
     };
-    let Some(harness) = Harness::from_agent_name(agent) else {
-        return Ok(());
-    };
     let Some(pane_id) = find_pane_id(event) else {
         return Ok(());
+    };
+    let Some(harness) = Harness::from_agent_name(agent) else {
+        // An agent this plugin does not collect (for example the Hermes coding
+        // agent) took over this pane. Herdr reuses pane slots, so a previous
+        // supported agent's quota tokens can still be attached and would
+        // misattribute the new agent. Show it by name with no usage instead.
+        let display_name = crate::herdr::agent_display_name(agent);
+        return crate::herdr::report_unsupported_agent(
+            pane_id,
+            &display_name,
+            CacheStore::now_millis(),
+        );
     };
 
     let cache = CacheStore::from_env()?;
@@ -260,6 +269,44 @@ fn handle_named_pane(cache: &CacheStore, pane: AgentPane, topic_pane: Option<&st
     publish_pane_tokens(&panes, &tokens, CacheStore::now_millis())
 }
 
+/// Record a Claude session's served model from its transcript.
+///
+/// The transcript is the ground truth the statusLine payload cannot offer:
+/// a gateway-routed session reports its logical Anthropic selection while the
+/// transcript records the model actually served. An existing entry is
+/// overwritten only when the transcript proves it wrong — the collector's
+/// own naming of a directly served session stays untouched.
+fn enrich_claude_session_model(
+    cache: &CacheStore,
+    pane: &AgentPane,
+    snapshot: Option<&ProviderSnapshot>,
+) -> bool {
+    let Some(session_id) = pane.session.as_ref().and_then(|session| session.id()) else {
+        return false;
+    };
+    let recorded = snapshot.and_then(|snapshot| snapshot.session_models.get(session_id));
+    let Some(transcript) = crate::providers::claude::transcript_for_session(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        session_id,
+    ) else {
+        return false;
+    };
+    let Some(model) = crate::providers::claude::transcript_model(&transcript) else {
+        return false;
+    };
+    let gateway_routed = !crate::providers::claude::is_anthropic_model_id(&model);
+    if recorded == Some(&model)
+        && snapshot.is_some_and(|snapshot| {
+            gateway_routed == snapshot.session_gateway_routed.contains_key(session_id)
+        })
+    {
+        return false;
+    }
+    cache
+        .record_session_model(Provider::Claude, session_id, model, gateway_routed)
+        .is_ok()
+}
+
 fn resolved_pane_tokens(
     cache: &CacheStore,
     pane: &mut AgentPane,
@@ -281,7 +328,7 @@ fn resolved_pane_tokens(
         }
         Resolution::Subscription(target) => {
             if let Some(provider) = target.original_provider() {
-                let snapshot = cache.load(provider)?;
+                let mut snapshot = cache.load(provider)?;
                 let (account_id, mtime) = current_account_gate(provider);
                 let usable = snapshot
                     .as_ref()
@@ -294,6 +341,22 @@ fn resolved_pane_tokens(
                         }
                     }
                 }
+                // A gateway-routed Claude session reports its logical model in
+                // statusLine while the transcript records what was actually
+                // served. A session the statusLine collector has not recorded
+                // (fresh, or a collector that was swapped out) gets its model
+                // from the transcript so the pane never shows another
+                // session's name.
+                if provider == Provider::Claude
+                    && enrich_claude_session_model(cache, pane, snapshot.as_ref())
+                {
+                    // The transcript proved something the loaded snapshot
+                    // did not know; render from the corrected one.
+                    snapshot = cache.load(provider)?;
+                }
+                let usable = snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.usable_for_account(account_id.as_deref(), mtime));
                 tokens_for_loaded_snapshot(
                     provider,
                     snapshot.as_ref(),

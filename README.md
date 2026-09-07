@@ -21,7 +21,9 @@ account; confirmed PAYG sessions clear stale subscription quota.
 
 ## Install
 
-Requires Herdr 0.8.0+, Rust 1.95+, macOS or Linux, and at least one supported agent CLI.
+Requires Herdr 0.8.0+ (0.8.2+ on Windows), Rust 1.95+, and at least one
+supported agent CLI. `install.sh` is for macOS and Linux; on Windows build
+and link the plugin yourself (see below).
 
 ```sh
 git clone https://github.com/levi-qiao/herdr-agent-quota.git
@@ -34,6 +36,30 @@ Restart already-running agent panes once. To install only a subset:
 ```sh
 ./install.sh --agent claude,codex,omp
 ```
+
+### Windows
+
+Herdr 0.8.2+ runs natively on Windows and so does this plugin: the manifest
+commands are plain argv (no `sh` needed), home paths resolve through `HOME`
+first and `USERPROFILE` otherwise, statusLine commands run through
+`cmd /S /C`, Herdr's config is read from `%APPDATA%\herdr`, and the Agent
+panel ordering speaks Herdr's named-pipe socket. Build, link, configure:
+
+```powershell
+git clone https://github.com/levi-qiao/herdr-agent-quota.git
+cd herdr-agent-quota
+cargo build --release
+herdr plugin link . --enabled
+herdr plugin action invoke configure --plugin herdr-agent-quota
+```
+
+`herdr plugin link` does not run the build step, so build first. The
+`configure` action installs the sidebar rows, keybindings, and collectors,
+then reloads the running server. For a subset, pass options through the
+plugin config directory exactly as `install.sh` does on Unix, or run
+`.\target\release\herdr-agent-quota.exe configure --agent claude,codex --apply`
+directly.
+
 
 `install.sh` only rewrites the shared `ui.sidebar.agents.rows` array when it is
 empty, contains only rows already managed by the plugin, or matches Herdr's
@@ -109,7 +135,7 @@ herdr plugin action invoke refresh --plugin herdr-agent-quota
 | Agent | Quota support | Session diagnostics |
 | --- | --- | --- |
 | Claude Code | 5h + 7d | model, context, cache, recorded prompt-cache expiry |
-| OpenAI Codex | 5h + 7d | model, context, cache, estimated 30m cache TTL, summary |
+| OpenAI Codex | 5h + 7d (paid); 30d on the ChatGPT free plan | model, context, cache, estimated 30m cache TTL, summary |
 | Grok CLI | 7d or 30d | model, context, cache |
 | Agy / Antigravity | 5h + 7d | statusLine model, context, cache |
 | OpenCode | OpenCode Go 5h + 7d; 30d in dashboard | exact local session model/context |
