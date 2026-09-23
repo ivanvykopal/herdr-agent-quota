@@ -295,6 +295,12 @@ fn enrich_claude_session_model(
         return false;
     };
     let gateway_routed = !crate::providers::claude::is_anthropic_model_id(&model);
+    // A directly served session is already named by the statusLine hook
+    // ("Opus 4.8"); replacing that with the transcript's raw id would make
+    // the two writers flip the label on every tick.
+    if !gateway_routed && recorded.is_some() {
+        return false;
+    }
     if recorded == Some(&model)
         && snapshot.is_some_and(|snapshot| {
             gateway_routed == snapshot.session_gateway_routed.contains_key(session_id)
@@ -673,7 +679,12 @@ fn should_skip_fetch(
     force: bool,
     now_unix: u64,
 ) -> Result<bool> {
-    if force || !cache.should_debounce(provider, now_unix, 60)? {
+    // Claude and Agy "fetch" by reading the hook's local observation file, so
+    // a debounce saves nothing and only delays the quota the hook just wrote.
+    if force
+        || matches!(provider, Provider::Claude | Provider::Agy)
+        || !cache.should_debounce(provider, now_unix, 60)?
+    {
         return Ok(false);
     }
     if load_usable_snapshot(cache, provider)?.is_some() {

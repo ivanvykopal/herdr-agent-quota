@@ -12,12 +12,20 @@ use std::path::PathBuf;
 /// tests rely on. On Windows, `USERPROFILE` is the fallback, and the
 /// `directories` crate is the last resort for the exotic case where neither
 /// variable survives into the process.
+///
+/// On Windows a `HOME` that is not an absolute Windows path is ignored: a
+/// process started from Git Bash/MSYS can inherit `/c/Users/me`, which Rust
+/// would resolve as `C:\c\Users\me` and miss every agent's data.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .filter(|path| !cfg!(windows) || path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
 }
 
@@ -50,24 +58,6 @@ pub fn shell_quote(path: &std::path::Path) -> String {
     }
 }
 
-/// Prefix a command with an environment variable, in the syntax of the
-/// platform's shell. The value is quoted for that shell by this helper.
-///
-/// POSIX takes `VAR=value command` as one statement. `cmd.exe` needs a
-/// `set` whose quoting keeps trailing separators out of the value; a
-/// Windows path cannot contain a double quote, so that form is always safe.
-pub fn env_prefix(name: &str, value: &std::path::Path) -> String {
-    if cfg!(windows) {
-        format!("set \"{}={}\" && ", name, value.display())
-    } else {
-        format!(
-            "{}={} ",
-            name,
-            value.display().to_string().replace('\'', "'\\''")
-        )
-    }
-}
-
 /// Kill a spawned process and every descendant it started.
 ///
 /// Unix callers put the child in its own process group and signal the
@@ -96,16 +86,6 @@ mod tests {
             assert_eq!(quoted, "\"/tmp/a b\"");
         } else {
             assert_eq!(quoted, "'/tmp/a b'");
-        }
-    }
-
-    #[test]
-    fn env_prefix_uses_the_platform_shell_syntax() {
-        let prefix = env_prefix("HERDR_PLUGIN_STATE_DIR", std::path::Path::new("/state"));
-        if cfg!(windows) {
-            assert_eq!(prefix, "set \"HERDR_PLUGIN_STATE_DIR=/state\" && ");
-        } else {
-            assert_eq!(prefix, "HERDR_PLUGIN_STATE_DIR=/state ");
         }
     }
 }

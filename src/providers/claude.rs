@@ -281,7 +281,10 @@ pub(crate) fn transcript_model(path: &Path) -> Option<String> {
             .pointer("/message/model")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|model| !model.is_empty())
+            // Claude Code writes `<synthetic>` for turns it fabricates locally
+            // (interrupts, API errors). It names no served model; taking it
+            // would blank the label and mark a direct session gateway-routed.
+            .filter(|model| !model.is_empty() && *model != "<synthetic>")
         {
             model = Some(served.to_string());
         }
@@ -575,6 +578,25 @@ mod tests {
         assert_eq!(
             transcript_model(transcript.path()).as_deref(),
             Some("glm-5.3")
+        );
+    }
+
+    #[test]
+    fn transcript_model_ignores_synthetic_turns() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            concat!(
+                r#"{"type":"assistant","message":{"model":"kimi-k3"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"model":"<synthetic>"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_model(transcript.path()).as_deref(),
+            Some("kimi-k3")
         );
     }
 

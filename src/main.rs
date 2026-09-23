@@ -59,7 +59,24 @@ fn main() -> Result<()> {
             result
         }
         Command::OpenSettings => herdr_agent_quota::herdr::open_settings_pane(),
-        Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
-        Command::AgyStatusline => herdr_agent_quota::configure::agy::run_statusline_hook(),
+        Command::ClaudeStatusline { state_dir } => {
+            use_state_dir(state_dir);
+            herdr_agent_quota::configure::claude::run_statusline_hook()
+        }
+        Command::AgyStatusline { state_dir } => {
+            use_state_dir(state_dir);
+            herdr_agent_quota::configure::agy::run_statusline_hook()
+        }
+    }
+}
+
+/// Make an explicit `--state-dir` the cache root for this process.
+///
+/// `CacheStore::from_env` and the chained collector both read the variable,
+/// so setting it once here keeps every consumer on the same directory. Runs
+/// before any thread is spawned.
+fn use_state_dir(state_dir: Option<std::path::PathBuf>) {
+    if let Some(state_dir) = state_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state_dir);
     }
 }

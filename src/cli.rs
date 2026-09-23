@@ -126,9 +126,19 @@ pub enum Command {
     /// open-settings action; not for manual use.
     OpenSettings,
     /// Claude statusLine hook. Claude Code invokes this; not for manual use.
-    ClaudeStatusline,
+    ClaudeStatusline {
+        /// Plugin state directory. Passed as an argument, not an environment
+        /// prefix, because the harness picks the shell (Git Bash, `cmd.exe`,
+        /// `sh`) and no single env-assignment syntax works in all of them.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
     /// Agy statusLine hook. Antigravity invokes this; not for manual use.
-    AgyStatusline,
+    AgyStatusline {
+        /// Plugin state directory; see `claude-statusline --state-dir`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

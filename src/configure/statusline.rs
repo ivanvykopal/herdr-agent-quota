@@ -60,11 +60,16 @@ impl Adapter {
             fs::write(&backup, serde_json::to_vec_pretty(&original)?)
                 .with_context(|| format!("write {} statusLine backup", self.label))?;
         }
+        // The harness chooses the shell: Claude Code runs statusLine through
+        // Git Bash on Windows, other setups use `cmd.exe` or `sh`. An env
+        // assignment prefix is shell-specific (`set "X=.." &&` is a no-op in
+        // bash, which silently sent observations to a fallback directory), so
+        // the state directory travels as a quoted argument every shell reads.
         let wrapper_command = format!(
-            "{}{} {}",
-            crate::platform::env_prefix("HERDR_PLUGIN_STATE_DIR", state),
+            "{} {} --state-dir {}",
             shell_quote(executable),
-            self.subcommand
+            self.subcommand,
+            shell_quote(state)
         );
         let status_line = settings
             .get_mut("statusLine")
@@ -164,24 +169,61 @@ impl Adapter {
         else {
             return Ok(None);
         };
-        // The wrapper is written in the platform shell's syntax: a POSIX
-        // env-var prefix, or `cmd.exe`'s quoted `set ... &&`.
-        let state = if let Some(rest) = command.strip_prefix("HERDR_PLUGIN_STATE_DIR='") {
-            rest.split_once("' ").map(|(state, _)| state)
-        } else if let Some(rest) = command.strip_prefix("set \"HERDR_PLUGIN_STATE_DIR=") {
-            rest.split_once("\" && ").map(|(state, _)| state)
-        } else {
-            None
-        };
-        let Some(old_state) = state else {
+        let Some(old_state) = wrapper_state_dir(command) else {
             return Ok(None);
         };
-        let backup = Path::new(old_state).join(self.backup_file);
+        let backup = old_state.join(self.backup_file);
         if !backup.exists() {
             return Ok(None);
         }
         let value = serde_json::from_slice(&fs::read(backup)?)?;
         Ok(Some(value))
+    }
+}
+
+/// The state directory a previously written wrapper points at.
+///
+/// Recognizes the current `--state-dir` argument form and both legacy
+/// env-prefix forms (POSIX `VAR='..' cmd`, `cmd.exe` `set "VAR=.." && cmd`),
+/// so an upgrade still finds the user's original statusLine backup.
+fn wrapper_state_dir(command: &str) -> Option<PathBuf> {
+    if let Some((_, rest)) = command.split_once(" --state-dir ") {
+        let rest = rest.trim();
+        let state = if let Some(quoted) = rest.strip_prefix('"') {
+            quoted.split_once('"')?.0.to_string()
+        } else if rest.starts_with('\'') {
+            unquote_posix(rest)?
+        } else {
+            rest.split_whitespace().next()?.to_string()
+        };
+        return Some(PathBuf::from(state));
+    }
+    if let Some(rest) = command.strip_prefix("HERDR_PLUGIN_STATE_DIR='") {
+        return rest.split_once("' ").map(|(state, _)| PathBuf::from(state));
+    }
+    if let Some(rest) = command.strip_prefix("set \"HERDR_PLUGIN_STATE_DIR=") {
+        return rest
+            .split_once("\" && ")
+            .map(|(state, _)| PathBuf::from(state));
+    }
+    None
+}
+
+/// Read one leading POSIX single-quoted word, including `'\''` escapes.
+fn unquote_posix(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let body = rest.strip_prefix('\'')?;
+        let (segment, after) = body.split_once('\'')?;
+        out.push_str(segment);
+        match after.strip_prefix("\\'") {
+            Some(next) => {
+                out.push('\'');
+                rest = next;
+            }
+            None => return Some(out),
+        }
     }
 }
 
@@ -228,4 +270,34 @@ fn write_settings(path: &Path, settings: &Value, label: &str) -> Result<()> {
 
 fn shell_quote(path: &Path) -> String {
     crate::platform::shell_quote(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_wrapper_form_yields_its_state_dir() {
+        for (command, state) in [
+            (
+                r#""C:\bin\herdr-agent-quota.exe" claude-statusline --state-dir "C:\state dir""#,
+                r"C:\state dir",
+            ),
+            (
+                r"'/bin/herdr-agent-quota' claude-statusline --state-dir '/it'\''s/state'",
+                "/it's/state",
+            ),
+            (
+                "HERDR_PLUGIN_STATE_DIR='/old' '/bin/herdr-agent-quota' claude-statusline",
+                "/old",
+            ),
+            (
+                r#"set "HERDR_PLUGIN_STATE_DIR=C:\old" && "C:\bin\herdr-agent-quota.exe" claude-statusline"#,
+                r"C:\old",
+            ),
+        ] {
+            assert_eq!(wrapper_state_dir(command), Some(PathBuf::from(state)), "{command}");
+        }
+        assert_eq!(wrapper_state_dir("npx -y ccstatusline@latest"), None);
+    }
 }
