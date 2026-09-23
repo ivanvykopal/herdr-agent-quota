@@ -1,5 +1,7 @@
 # CLI 额度窗口重置时间能力调研
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 > 研究日期：2026-08-15（Asia/Shanghai）  
 > 范围：本仓库现有四个 provider（Codex、Grok、Claude Code、Agy/Antigravity）。  
 > 来源约束：只使用供应商官方文档/官方 CLI 源码，以及本仓库已有 parser、fixture 和类型；没有用二手文章推断供应商字段。
@@ -144,7 +146,7 @@ ResetAt(i64)                 # Unix 秒，统一绝对时间
 
 ### 4. 明确刷新语义
 
-当前插件是事件触发、无常驻 daemon；metadata token 写入后 TTL 为一天，sidebar 不会自行每分钟重算（[`src/herdr.rs`](../../src/herdr.rs#L104-L114)；计划文档也明确排除 live countdown）。因此：
+当前插件是事件触发、无常驻 daemon；metadata token 写入后 TTL 为一天，sidebar 不会自行每分钟重算（[`src/herdr.rs`](../../src/herdr.rs#L104-L114)）。因此：
 
 - dashboard 读取缓存时可用当前时间即时计算 ETA；
 - sidebar 若要求数字实时跳动，需要新增受控的 refresh interval/事件，而不是在 formatter 中启动线程或 daemon；

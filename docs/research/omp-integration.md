@@ -1,5 +1,7 @@
 # omp（oh-my-pi）接入研究
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 > 研究日期：2026-09-01（Asia/Shanghai）
 > 复核版本：omp `18.0.11`（`https://omp.sh/install` 下载的 darwin-arm64 独立二进制，本机实测）；
 > 源码 `can1357/oh-my-pi` main（2026-08-31 21:30 UTC，MIT，28.7k star）；

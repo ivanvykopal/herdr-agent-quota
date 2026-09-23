@@ -1,5 +1,7 @@
 # OMP/Claude 订阅额度与开源实现研究
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 > 研究日期：2026-09-01（Asia/Shanghai）  
 > 目标：确认本仓库引用的 OMP（oh-my-pi/`omp`）如何表示额度，以及额度是否按“厂商”共享；再用其他开源项目交叉核对 Claude/Codex 的获取和展示方式。  
 > 方法：研究步骤只读上游源码与项目文档；没有读取任何 `agent.db`、OAuth token 或凭据文件。
@@ -92,7 +94,7 @@ omp usage --json --redact --provider anthropic
 
 仅凭“Claude Code 显示耗尽、OMP 可以登录”无法确定是哪一分支；必须先看上述无凭据输出。Claude Code 本身是闭源客户端，因此本研究不能从公开源码证明 Anthropic 对所有客户端的跨产品共享规则；“同 OAuth 账号/org 调同一 usage endpoint ⇒ 大概率同池”应标为推断。
 
-## 4. 对 herdr-agent-quota 的含义
+## 4. 对 herdr-agent-usage 的含义
 
 - OMP 适配应把 provider 具体传给 `omp usage --json --provider <id>`，而不是请求“所有 provider”后猜测厂商池。
 - 归属键至少保留 provider + accountId/orgId（必要时 projectId）；只在 OMP 报告声明的同一 scope 内展示 `shared` 窗口。

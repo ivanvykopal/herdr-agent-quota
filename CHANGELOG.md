@@ -6,6 +6,363 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The GitHub repository and Herdr plugin id are now
+  [`levi-qiao/herdr-agent-usage`](https://github.com/levi-qiao/herdr-agent-usage)
+  / `herdr-agent-usage`. `./install.sh` adopts config and state from
+  `herdr-agent-quota` even when Herdr has already switched the linked id, then
+  unlinks the old id if it is still listed. The first launch of the new binary
+  does the same for the state and config directories Herdr injects. Files the
+  new directory already has are kept. The previous Cursor hook script stays at
+  its old path until `./install.sh` rewrites `hooks.json`. `./uninstall.sh`
+  restores either id.
+
+### Fixed
+
+- A Claude or Agy statusLine payload that reports only a model id, such as a
+  model released after this build, now shows that id instead of a blank
+  model. The display name is still preferred when the payload has one.
+- `configure --check` reports a Claude or Agy statusLine hook that still
+  feeds another install (for example the pre-rename `herdr-agent-quota`
+  binary and state directory) as stale instead of installed. Such a hook
+  never reaches this plugin, so new sessions show no model or quota until
+  `configure --apply` rewrites it.
+- Codex quota and per-session models refresh again when Herdr runs the
+  plugin. Herdr's server PATH can omit Homebrew, so every hook, action, and
+  watcher fetch failed to start `codex app-server` and kept a stale snapshot
+  whose model belonged to whatever session a terminal refresh last saw. With
+  no `$CODEX_BIN_PATH` and no `codex` on PATH, the collector now tries
+  `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`.
+- `$CODEX_BIN_PATH` set to an npm-style codex shim now starts under Herdr's
+  server PATH too. The collector prepends the override's parent directory
+  to the child PATH the same way the automatic fallback does, so a shim
+  beginning with `#!/usr/bin/env node` resolves `node` next to itself
+  instead of failing with `env: node: No such file or directory`.
+- Codex panes launched through wrappers that suppress Codex hooks now recover
+  their session from Herdr's foreground cwd plus the native Codex process
+  start time, matched to exactly one rollout's `session_meta`. The recovery
+  runs on every agent inventory read, so the active-turn watcher, focus, and
+  sibling publishes keep that session's model and context instead of
+  borrowing the newest provider-wide rollout between manual refreshes. Only
+  rollouts dated within a day of the process start are opened. Ambiguous
+  matches remain unresolved.
+- OpenCode 2 sessions resolve again. OpenCode 2 keeps new sessions in
+  `session_v2`/`session_message` and carries the role in the `type` column,
+  neither of which the collector read: every session created after the upgrade
+  looked absent, so its pane lost the model, context, and OpenCode Go quota
+  rows. Both store layouts are read now, and a migrated session keeps the
+  evidence it already had.
+- Cursor quota follows a `cursor-agent login` account switch while a watch
+  process is already running. The previous token stays valid, and the
+  one-time Keychain approval marker does not move, so caching that secret
+  against the marker kept fetching the old account's Dashboard usage.
+
+## [1.6.2] - 2026-09-20
+
+### Fixed
+
+- Running the integration suite from a Herdr pane no longer disrupts the
+  current Agent view or temporarily puts a Space header between its own agents.
+- Forced quota refresh restores the Agent view. Herdr drops a plugin-owned
+  view on disable, and enable does not run startup, so Space grouping fell
+  back to native `grouped` until the next server restart. Event/focus/watch
+  still do not touch the view.
+- The Cursor hook wrapper lives in plugin state instead of `~/.cursor`.
+  `afterAgentResponse` and `stop` each spawned `bash` against a
+  Cursor-provenance path, so Ghostty prompted `SystemPolicyAppData` twice
+  per turn. Restart an already-running Cursor pane after configure so it
+  reloads `hooks.json`.
+
+- macOS no longer opens Cursor.app's `~/Library/Application Support/Cursor/…/state.vscdb`
+  unless `$CURSOR_STATE_DB` is set, and Herdr-spawned processes no longer read
+  `~/.cursor` (chats `store.db`, `cli-config.json`, `auth.json`) unless
+  `$CURSOR_HOME` / `$CURSOR_AUTH_FILE` / `$CURSOR_STATE_DB` is set. Those trees
+  carry Cursor `com.apple.provenance`; this plugin is ad-hoc signed, so each
+  event/watch/hook process was prompting Ghostty `SystemPolicyAppData`
+  ("would like to access data from other apps"). Credentials stay on Keychain;
+  model/cache/context stay on the hook mailbox. The cache identity mtime is
+  the plugin-state Keychain marker, not a `stat` of `~/.cursor/auth.json` —
+  that leftover watch-tick was enough to keep the dialog after file reads
+  were already gated. The Keychain approval marker moves to plugin state
+  (`cursor-keychain-approved`); configure copies a legacy
+  `~/.cursor/.herdr-keychain-approved` once. A CLI login never falls through
+  to the IDE token, including `AGENT_CLI_CREDENTIAL_STORE=file`.
+
+### Added
+
+- Agent setup playbook (`docs/agent-setup.md`, `docs/agent-setup.zh-CN.md`)
+  and a copy-paste prompt in both READMEs, so a coding agent on the machine
+  that runs Herdr can detect local CLIs, install matching collectors, and
+  finish font maps, Herdr integrations, and macOS Keychain approval instead
+  of stopping at `./install.sh`.
+
+## [1.6.1] - 2026-09-18
+
+### Fixed
+
+- Teal (unseen-done) brand icons no longer sit one cell to the right of idle
+  ones. Colour is a `rules` match on `$quota_icon` so the glyph stays the
+  first identity token; a later `$quota_icon_done` twin hang-indented under
+  the Space name. Working uses U+2061, not ZWNJ: ZWNJ joins the vendor PUA
+  glyph and the icon font then draws a yellow `?`.
+- Cursor quota follows a `cursor-agent login` account switch on macOS. The
+  CLI now stores that login in Keychain (`cursor-access-token` /
+  `cursor-user`) and no longer writes `auth.json`; the collector was falling
+  through to a stale desktop `state.vscdb` token. It now reads the CLI
+  Keychain item (after a one-time `--keychain-approve`) and does not borrow
+  the IDE token while `cli-config.json` still has `authInfo`.
+- Cursor sidebar model follows the CLI footer after a model switch:
+  `lastUsedModel` of `default` / `auto` uses `cli-config.json` instead of
+  staying labelled Auto.
+
+### Changed
+
+- Account quota windows (`5h` / `7d` / `30d`) appear on one pane per
+  login-scoped vendor in each Space (Grok, Codex, Devin, OpenCode, Cursor).
+  Extra tabs of that vendor in the same Space stay in the Agent panel with
+  their model, topic, and context; only the duplicate 5h/7d/30d rows are
+  omitted. The lexicographically first pane id in that Space keeps the
+  windows, so focus and working status do not move the shared row. A Grok
+  in another Space keeps its own windows. OpenCode and OpenCode Go are the
+  same group. Claude and Agy stay per-pane. On a wide sidebar, two or more
+  panes of the same vendor
+  in one Space nest: the head is the brand icon, vendor name, and quota;
+  every pane of that vendor still lists model, topic, and context. Extra
+  tabs have no icon and use the same Space indent as other agents, not an
+  extra nest. Narrow sidebars stay flat. Nested vendor children stay
+  flush even when the settings row gap is 1: Herdr's own `row_gap` would
+  also split those children, so the plugin packs the sidebar and paints
+  the blank after the last child (and after un-nested panes).
+
+## [1.6.0] - 2026-09-17
+
+### Changed
+
+- Agent order defaults to `quota`: Space grouping with least headroom first
+  inside each space. `configure` also writes `ui.agent_panel_sort = "spaces"`
+  when the user has not set a sort themselves.
+- Default sidebar fields omit cache and TTL (`provider,topic,model,context,5h,7d,30d`).
+  Turn them on in settings when needed.
+- Sidebar identity uses Space group headers plus brand icons whose colour
+  mirrors Herdr `agent_status` (working / done / idle) — no `state_icon` ring.
+  README screenshots show the wide gauges layout only.
+
+### Added
+
+- The Claude Code status line ends with a spending pace for the binding
+  quota window, `⏱ 5h ↓12%`: quota consumed versus how much of the window's
+  clock has run, in points. `↓` means slow down, `↑` means there is headroom,
+  `=` is within five points. It paces against the live window with the least
+  remaining quota and names it (`5h`/`7d`); when that window cannot be paced
+  nothing is shown rather than pacing the looser one: no reset time, expired,
+  or in the first 5% of the window.
+- Cursor Agent CLI is a supported harness: `--agent cursor`, `--provider cursor`,
+  its own settings row, and a sidebar row with a Cursor brand color. Quota is
+  the included monthly pool from the same
+  `aiserver.v1.DashboardService/GetCurrentPeriodUsage` call the CLI makes,
+  authenticated with `accessToken` in `~/.cursor/auth.json` (macOS) or
+  `$XDG_CONFIG_HOME/cursor/auth.json` (Linux), or `$CURSOR_AUTH_FILE`. When
+  that file is missing or has no token, the collector reads only
+  `cursorAuth/accessToken` from the desktop app's `state.vscdb`, opened
+  read-only. The IDE database's mtime is never a credential gate. Included
+  follows the CLI usage panel: `totalPercentUsed` when present, otherwise
+  `includedSpend / limit`. Auto, API, and Included map onto at / api / 30d.
+  A 30d sidebar field was added so a monthly window is not hidden behind 7d.
+  Model comes from
+  `cli-config.json` (`selectedModel` mapped through `model.displayName`); a
+  session's `lastUsedModel` overrides it. The sidebar title uses Grok's hue.
+  The generated session title (`meta.json` `title`, else `store.db` `name`) is
+  the topic, so a follow-up does not replace the session name; placeholder
+  `New Agent` falls back to the last `<user_query>` in the session jsonl.
+  Cursor panes are never read. Cache and context come from the interactive CLI's
+  `afterAgentResponse` / `stop` / `preCompact` hooks (token counts and, when
+  present, `context_usage_percent` / `context_window_size`). Composer 2.x
+  uses its documented 200k window when the hook omits the size. Cycle end is
+  Unix milliseconds. Snapshots are stamped with
+  `sha256("cursor\0" || token)`. The collector never writes or refreshes
+  Cursor credentials, never opens Keychain, and never calls a bare `agent`
+  binary.
+
+### Fixed
+
+- Sidebar quota rows that would have printed `N/A` are omitted instead, for
+  every provider. A missing or expired 5h/7d/30d window no longer occupies a
+  row; `quota_error` still explains an unusable snapshot.
+- Cursor `cx` now reads `store.db` `token_details` (`used_tokens` /
+  `max_tokens`), the same conversation accounting the CLI footer shows as
+  `Auto · 8.1%`. Hook mailboxes still supply cache, and remain the fallback
+  when a session store has no token details.
+- Agy Gemini sessions also publish the third-party (Claude/GPT) pool as `api`
+  on the monthly slot, so that quota is visible without replacing 5h/7d.
+
+- Cursor sidebar topic prefers the generated session title over the last
+  `<user_query>`, so a follow-up like "look back at our todos" no longer
+  replaces the session name. Placeholder `New Agent` still falls back to the
+  last query.
+- Grok sidebar topic uses `summary.json` `generated_title` (else
+  `session_summary`) from the local session metadata, so a pane whose last
+  prompt has scrolled off still has a name. Chat history is not read.
+- Codex sidebar model no longer sticks on the session-start `turn_context`.
+  A long turn writes `turn_context` once at the beginning, then enough
+  `token_count` / tool output that the 256 KB tail has no model line. The
+  previous head fallback then published the first turn's model (`Codex/gpt-6-astra`
+  while the TUI footer already showed `gpt-5.6-sol`). The collector now
+  scans backwards from EOF for the latest `turn_context`, capped so a 40 MB
+  rollout is not read on every watch pulse.
+- `rustls` 0.23.43 → 0.23.45 (`RUSTSEC-2026-0285`). It is a `ureq` TLS
+  dependency; the collector sends bearer tokens to provider endpoints, so a
+  known-vulnerable handshake stack fails `cargo audit --deny warnings`.
+
+## [1.5.5] - 2026-09-14
+
+### Added
+
+- Muse Code (Meta Muse Spark) is a supported harness: `--agent muse`,
+  `--provider muse`, its own settings row, and a sidebar row with a Muse brand
+  color. Quota is the `subs_usage` block of the same `muse-code/key` call the
+  CLI makes at startup and for `/usage`, authenticated with the account login
+  in `~/.config/muse/auth.json` (or `$XDG_CONFIG_HOME` / `$MUSE_AUTH_PATH`).
+  A `storage: "keychain"` login (typical on macOS) keeps the token out of that
+  file; the collector reads the CLI's Keychain item through
+  `security find-generic-password`, with a deadline so a prompt cannot stall a
+  refresh, and keeps a successful token in-process for the daemon lifetime.
+  The call returns the key the CLI already stored, so polling it does not
+  sign Muse out. The session window is published as 5h and the weekly window
+  as 7d; a different advertised session length keeps its own label. Only the
+  usage block is read — the key and account identity in the same response
+  are discarded. Snapshots are stamped with `sha256("muse\0" || token)`.
+  API-key logins and inactive subscriptions show no quota but keep the
+  session fields below. A rejected token or a failed request keeps the last
+  quota cached for that account.
+- Muse panes get model, topic, context, and cache like other agents. Herdr
+  reports no Muse session, so on Linux the pane is matched to its session
+  through Muse's own `.session.lock` (`pid=<n>`) and the `HERDR_PANE_ID` the
+  `muse-bin` process inherited. The session's `session.jsonl` tail supplies
+  the last model call's model and token usage — context against the local
+  `model-catalog` limit, cache as that call's read share — and the last
+  submitted prompt as the topic, so Muse panes are never read for a topic.
+  Muse publishes no prompt-cache lifetime, so there is no TTL. Without that
+  evidence (for example on macOS) the pane shows quota and the default model
+  only.
+- The provider name is a sidebar field like any other: `--fields` and the
+  settings pane accept `provider`, listed first. It defaults on, so an
+  existing configuration renders exactly as before; turning it off leaves the
+  row with its icon and numbers. A packed identity row follows its two halves,
+  so hiding the model degrades `$quota_provider_model` to `$quota_provider`,
+  hiding the provider degrades it to `$quota_model`, and hiding both writes
+  no identity row. The error token stays unconditional: it says the plugin
+  could not speak for a pane, which is a failure, not a field.
+
+### Fixed
+
+- A saved agent list that was complete before a new provider was added no
+  longer makes `configure` abort when omp is not installed. Those builds
+  wrote "everything on" as an enumeration (`claude,codex,grok,agy,opencode,pi,omp,devin`
+  before Muse), which was then judged partial against the longer supported
+  list, so a missing omp integration became a hard failure. That exact
+  prefix is still read as every agent. A complete selection is now stored
+  as `all`, and a subset with a leading `only` marker, so turning the
+  newest agent off is not mistaken for the legacy full list.
+- An idle pane now follows its own session's quota as soon as the cache has it.
+  A Claude statusLine hook only writes the observation mailbox, so a pane that
+  never starts a turn kept publishing whatever it last published: one pane sat
+  on `7d 24%` and `5h N/A` while its session's stored windows had moved on and
+  every sibling pane showed the new reading. A watch pass now also covers an
+  idle pane whose published quota rows differ from the ones its cached
+  snapshot would render, alongside the existing expired-window case.
+- A `fields` preference saved before the provider was a field no longer hides
+  the provider on upgrade. Those builds wrote "everything on" as
+  `topic,model,cache,ttl,context,5h,7d` and drew the provider name regardless,
+  so that exact list is still read as every field. A selection that hides only
+  the provider is stored with a leading `no-provider` marker, which names it
+  without being mistaken for that legacy list.
+- Gauges now keeps `no cached` as an amber token when it joins the cache row;
+  live TTL continues to fold into the uncoloured cache token.
+- `omp usage` now passes `--profile` when the pane's agent directory is an omp
+  named profile (`~/.omp/profiles/<name>/agent`), so that pane is billed to
+  the profile's credential store rather than the default one. Non-profile
+  layouts still use `PI_CONFIG_DIR`.
+
+## [1.5.4] - 2026-09-10
+
+### Added
+
+- A third sidebar layout, `gauges`, now the default: each quota field gets
+  its own row with a meter beside the number. Bars fill to the printed
+  number, so `cx`, `5h`, `7d` and `30d` all follow `quota-percent`
+  (remaining by default). Labels are three characters so those periods
+  align; a provider-named window too long for the column keeps a plain row.
+  Cache and TTL share a line when they fit (`cache 95.2% · ttl≈29m`) and
+  split when the sidebar is too narrow. Meters size to the connected Herdr
+  endpoint after its secondary-row indent and scrollbar — six cells at the
+  default 26 columns, twelve at 32 or wider — and drop rather than clip.
+  The `cx` row takes a muted green/amber/red colour from remaining context.
+  New installs use `gauges`. Existing `packed` or `stacked` preferences are
+  kept and can still be chosen from the settings pane.
+
+### Fixed
+
+- A `gauges` sidebar that is too narrow for a meter no longer flips the
+  context number from remaining to used. Width lookup reads the connected
+  endpoint's client-shell file instead of whichever state file was written
+  last.
+
+## [1.5.3] - 2026-09-10
+
+### Fixed
+
+- Idle panes no longer keep a frozen remaining count after a quota window
+  resets. One policy covers every collector: a cached window whose reset is in
+  the past bypasses the 60-second fetch debounce, and a watcher already running
+  for another agent includes only those panes whose *displayed* windows have
+  expired. Codex `/status` is still a session-local cache and is not scraped.
+
+## [1.5.2] - 2026-09-08
+
+### Changed
+
+- Drop the native `agent` row from managed sidebar layouts. It duplicated the
+  branded `$quota_provider_model` line (`grok` above `Grok/grok-4.6`). The
+  machine/workspace/tab row stays; uninstall puts `agent` back.
+
+## [1.5.1] - 2026-09-08
+
+### Fixed
+
+- Recover background quota updates across Herdr upgrades and live handoffs;
+  normal installation/repair restores the watcher and retains preferences.
+  Refresh and event paths respect the saved agent selection.
+- Include Pi, OMP, and OpenCode in active-turn polling and complete a delayed
+  final refresh when a turn ends inside the request debounce window.
+- Bind OpenCode Go and ID-less Grok caches to their credentials; retain OMP
+  readings for all reported account pins without spawning once per account.
+- Remove unverified Codex rollout windows and rebuild legacy quota data from
+  authoritative API responses or original StatusLine payloads.
+
+### Changed
+
+- Claude/Agy quota is session-local because StatusLine does not prove account
+  identity. An unknown Agy model no longer combines two quota pools.
+- Consolidate English/Chinese usage and upgrade documentation; separate dated
+  research from current guidance and remove the completed internal task plan.
+
+## [1.5.0] - 2026-09-08
+
+### Changed
+
+- Require Herdr 0.9.0 or later. Native machine/workspace/tab and agent
+  identity rows stay above plugin fields in both sidebar layouts.
+- Keep Herdr's native token styling, Space Git rows, and worktree grouping.
+  Quota ordering remains opt-in.
+
+### Fixed
+
+- Focus events refresh the pane named in the event instead of the current
+  global focus, including delayed events and independent Herdr clients.
+- Reconfiguring managed shared Agent rows preserves added custom fields and
+  styles while still migrating recognized older plugin layouts.
+
 ## [1.4.0] - 2026-09-06
 
 ### Added
@@ -572,11 +929,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.4.0...HEAD
-[1.4.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.3.0...v1.4.0
-[1.3.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v0.2.0...v1.0.0
-[0.2.0]: https://github.com/levi-qiao/herdr-agent-quota/releases/tag/v0.2.0
-[0.1.0]: https://github.com/levi-qiao/herdr-agent-quota/releases/tag/v0.1.0
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.2...HEAD
+[1.6.2]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.1...v1.6.2
+[1.6.1]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.5...v1.6.0
+[1.5.5]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.4...v1.5.5
+[1.5.4]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.3...v1.5.4
+[1.5.3]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.2...v1.5.3
+[1.5.2]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v0.2.0...v1.0.0
+[0.2.0]: https://github.com/levi-qiao/herdr-agent-usage/releases/tag/v0.2.0
+[0.1.0]: https://github.com/levi-qiao/herdr-agent-usage/releases/tag/v0.1.0

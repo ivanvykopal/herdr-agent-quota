@@ -1,5 +1,7 @@
 # 侧栏额度行能否按宽度动态换行
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 研究日期：2026-08-31（Asia/Shanghai）
 范围：Herdr 0.8.0 官方配置/CLI/API 合同、本仓库现有拼接布局、截图里的截断现象。
 来源约束：Herdr 官方文档、本机 `herdr 0.8.0` 二进制与 `api schema`/`api snapshot`、本仓库 `src/configure/herdr.rs` / `src/herdr.rs`。不把社区插件 README 当 Herdr 合同，只作对照。

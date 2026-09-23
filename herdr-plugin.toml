@@ -1,8 +1,8 @@
-id = "herdr-agent-quota"
-name = "Herdr Agent Quota"
-version = "1.4.0"
-min_herdr_version = "0.8.0"
-description = "Credential-scoped AI quota and context for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, and Devin."
+id = "herdr-agent-usage"
+name = "Herdr Agent Usage"
+version = "1.6.2"
+min_herdr_version = "0.9.0"
+description = "Credential-scoped AI quota and context for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, Devin, Muse, and Cursor."
 platforms = ["macos", "linux", "windows"]
 
 [[build]]
@@ -10,62 +10,73 @@ command = ["cargo", "build", "--release"]
 
 # Commands are raw argv with the plugin directory as the working directory:
 # no `sh`, so every entry runs unchanged on macOS, Linux, and Windows. The
-# relative program name resolves to target/release/herdr-agent-quota(.exe).
-# Shell chaining used to live here (`&& herdr server reload-config`); the
-# binary issues that reload itself when Herdr launched it.
+# relative program name resolves to target/release/herdr-agent-usage(.exe).
+# Shell chaining used to live here (`&& herdr server reload-config`,
+# `&& ... startup`); the binary issues those follow-ups itself when Herdr
+# launched it.
 
 [[startup]]
-command = ["target/release/herdr-agent-quota", "startup", "--provider", "all"]
+command = ["target/release/herdr-agent-usage", "startup", "--provider", "all"]
 
 [[actions]]
 id = "refresh"
 title = "Refresh agent quota"
-command = ["target/release/herdr-agent-quota", "refresh", "--provider", "all", "--force"]
+command = ["target/release/herdr-agent-usage", "refresh", "--provider", "all", "--force"]
 
 [[actions]]
 id = "configure"
 title = "Install / repair agent quota"
-command = ["target/release/herdr-agent-quota", "configure", "--apply"]
+command = ["target/release/herdr-agent-usage", "configure", "--apply"]
 
 [[actions]]
 id = "open-settings"
 title = "Open agent quota settings"
-command = ["target/release/herdr-agent-quota", "open-settings"]
+command = ["target/release/herdr-agent-usage", "open-settings"]
 
 [[actions]]
 id = "uninstall"
 title = "Uninstall agent quota configuration"
-command = ["target/release/herdr-agent-quota", "configure", "--uninstall"]
+command = ["target/release/herdr-agent-usage", "configure", "--uninstall"]
 
 [[events]]
 id = "agent-quota-refresh"
 on = "pane.agent_detected"
-command = ["target/release/herdr-agent-quota", "event"]
+command = ["target/release/herdr-agent-usage", "event"]
 
 [[events]]
 id = "agent-quota-status-refresh"
 on = "pane.agent_status_changed"
-command = ["target/release/herdr-agent-quota", "event"]
+command = ["target/release/herdr-agent-usage", "event"]
 
 [[events]]
 id = "focused-agent-quota-refresh"
 on = "pane.focused"
-command = ["target/release/herdr-agent-quota", "focus"]
+command = ["target/release/herdr-agent-usage", "focus"]
+
+[[events]]
+id = "focused-workspace-agent-quota-refresh"
+on = "workspace.focused"
+command = ["target/release/herdr-agent-usage", "focus"]
+
+[[events]]
+id = "focused-tab-agent-quota-refresh"
+on = "tab.focused"
+command = ["target/release/herdr-agent-usage", "focus"]
 
 [[panes]]
 id = "dashboard"
 title = "Agent quota"
-command = ["target/release/herdr-agent-quota", "dashboard"]
+command = ["target/release/herdr-agent-usage", "dashboard"]
 placement = "popup"
 
 [[panes]]
 id = "settings"
 title = "Agent quota settings"
-command = ["target/release/herdr-agent-quota", "settings"]
+command = ["target/release/herdr-agent-usage", "settings"]
 placement = "popup"
 # Every option on screen at once. The default half-size popup is 24 rows and
-# the list plus controls needs 28 interior rows, so without this the agents
+# the list plus controls needs 33 interior rows, so without this the agents
 # section opens below the fold.
 # Herdr clamps to the terminal, and the pane still scrolls when it has to.
 width = 78
-height = 31
+height = 35

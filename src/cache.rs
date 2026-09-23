@@ -1,6 +1,7 @@
 use crate::cli::{
     AgentOrder, BrandColors, FieldSet, LowQuotaAlert, PercentStyle, SidebarLayout, SidebarRowGap,
 };
+use crate::identity::PLUGIN_ID;
 use crate::model::{
     merge_omitted_window_list, window_in, BillingTarget, ContextUsage, Provider, ProviderSnapshot,
     UsageWindow, WindowKind,
@@ -9,7 +10,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +30,25 @@ const LOW_QUOTA_ALERT_FILE: &str = "low-quota-alert";
 /// One line per provider that is currently below the alert threshold, so a
 /// crossing notifies once instead of on every refresh.
 const LOW_QUOTA_ALERTED_FILE: &str = "low-quota-alerted";
+/// Panes that are mid-turn (`working`), finished but not yet acknowledged
+/// (`unseen`), or acknowledged since their last turn (`seen`). Brand-icon colour cannot use Herdr's server `agent_status`
+/// alone: same-tab completions are reported `idle` while the TUI ring is
+/// still teal. This file is the plugin's own seen-state.
+const ICON_ATTENTION_FILE: &str = "icon-attention.json";
 const MAX_STATUSLINE_SESSIONS: usize = 128;
+
+/// Working / unseen pane ids for `$quota_icon_*` colour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconAttention {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub working: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unseen: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub seen: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focused: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheStore {
@@ -47,7 +66,7 @@ impl CacheStore {
         let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
             .or_else(|| {
-                ProjectDirs::from("dev", "herdr", "herdr-agent-quota")
+                ProjectDirs::from("dev", "herdr", PLUGIN_ID)
                     .map(|dirs| dirs.data_local_dir().to_path_buf())
             })
             .context("cannot determine plugin state directory")?;
@@ -103,6 +122,64 @@ impl CacheStore {
             .join(format!(".{identity}.{}.tmp", std::process::id()));
         let bytes = serde_json::to_vec_pretty(snapshot).context("serialize quota snapshot")?;
         Self::atomic_replace(&destination, &temporary, bytes)
+    }
+
+    /// One sanitized report per OMP provider retains all reported account
+    /// pins without spawning the CLI once for each pane/account.
+    pub fn load_omp_usage(
+        &self,
+        target: &BillingTarget,
+    ) -> Option<crate::providers::omp::ProviderUsage> {
+        let bytes = fs::read(
+            self.root
+                .join(format!("{}.usage.json", target.cache_identity())),
+        )
+        .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn save_omp_usage(
+        &self,
+        target: &BillingTarget,
+        usage: &crate::providers::omp::ProviderUsage,
+    ) -> Result<()> {
+        self.ensure()?;
+        let mut usage = usage.clone();
+        let previous_accounts = self
+            .load_omp_usage(target)
+            .map(|report| report.accounts)
+            .unwrap_or_else(|| {
+                self.load_target(target)
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| {
+                        vec![crate::providers::omp::AccountUsage {
+                            pin: snapshot.account_id,
+                            windows: snapshot.windows,
+                            fetched_at_unix: snapshot.fetched_at_unix,
+                        }]
+                    })
+                    .unwrap_or_default()
+            });
+        for account in previous_accounts {
+            if account.pin.is_some()
+                && usage.oauth_without_usage_pins.contains(&account.pin)
+                && !usage
+                    .accounts
+                    .iter()
+                    .any(|current| current.pin == account.pin)
+            {
+                usage.accounts.push(account);
+            }
+        }
+        let name = format!("{}.usage.json", target.cache_identity());
+        Self::atomic_replace(
+            &self.root.join(&name),
+            &self
+                .root
+                .join(format!(".{name}.{}.tmp", std::process::id())),
+            serde_json::to_vec(&usage)?,
+        )
     }
 
     pub fn should_debounce_target(
@@ -193,7 +270,9 @@ impl CacheStore {
             let same_account =
                 previous.usable_for_account(snapshot.account_id.as_deref(), credentials_mtime_unix);
             if same_account {
-                snapshot.merge_omitted_windows(&previous);
+                // Direct quota responses are authoritative. In particular,
+                // an older Codex cache may contain a window borrowed from an
+                // unattributed rollout; never carry it into a fresh reading.
                 // A refresh scoped to one pane's session still must not delete
                 // what it never looked at. An agent event names a single pane,
                 // so the fetch only enriches that session; every other pane's
@@ -325,8 +404,8 @@ impl CacheStore {
 
     /// StatusLine payloads may temporarily omit context (before the first
     /// response and immediately after compaction). Keep the last known value.
-    /// Quota windows still come from the newest snapshot, except an omitted
-    /// 5h/weekly window is restored when it is still current.
+    /// Session-local quota windows come from the newest observation; omitted
+    /// windows are not restored from legacy profile-shared data.
     pub fn save_preserving_context(&self, snapshot: ProviderSnapshot) -> Result<()> {
         self.save_preserving_context_for_session(snapshot, None)
     }
@@ -598,11 +677,6 @@ impl CacheStore {
             .and_then(BrandColors::parse)
     }
 
-    pub fn set_brand_colors(&self, colors: BrandColors) -> Result<()> {
-        self.ensure()?;
-        fs::write(self.brand_colors_path(), colors.as_str()).context("write brand colors")
-    }
-
     pub fn clear_brand_colors(&self) -> Result<()> {
         match fs::remove_file(self.brand_colors_path()) {
             Ok(()) => Ok(()),
@@ -683,6 +757,62 @@ impl CacheStore {
             .context("write low quota alert state")
     }
 
+    pub fn icon_attention(&self) -> IconAttention {
+        fs::read(self.icon_attention_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn icon_attention_exists(&self) -> bool {
+        self.icon_attention_path().exists()
+    }
+
+    /// Serialize focus, event, and watcher updates to the same pane state.
+    pub fn lock_icon_attention(&self) -> Result<File> {
+        self.ensure()?;
+        let path = self.root.join("icon-attention.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(file)
+    }
+
+    pub fn set_icon_attention(&self, attention: &IconAttention) -> Result<()> {
+        // Always persist, even when both sets are empty. A missing file means
+        // "never tracked" and hydrates leftover `$quota_icon_done` tokens; an
+        // empty file means "everything has been seen".
+        self.ensure()?;
+        let destination = self.icon_attention_path();
+        let unchanged = fs::read(&destination)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<IconAttention>(&bytes).ok())
+            .as_ref()
+            == Some(attention);
+        if unchanged {
+            return Ok(());
+        }
+        let temporary = self
+            .root
+            .join(format!(".{ICON_ATTENTION_FILE}.{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec(attention).context("serialize icon attention")?;
+        Self::atomic_replace(&destination, &temporary, bytes)
+    }
+
+    pub fn clear_icon_attention(&self) -> Result<()> {
+        match fs::remove_file(self.icon_attention_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove icon attention state"),
+        }
+    }
+
     pub fn validate_watch_interval_seconds(seconds: u64) -> Result<u64> {
         Self::valid_watch_interval(seconds).with_context(|| {
             format!(
@@ -710,6 +840,32 @@ impl CacheStore {
         self.ensure()?;
         fs::write(self.refresh_marker_path(provider), now_unix.to_string())
             .context("write refresh marker")
+    }
+
+    pub fn mark_refresh_account(
+        &self,
+        provider: Provider,
+        now_unix: u64,
+        account: Option<&str>,
+    ) -> Result<()> {
+        self.mark_refresh(provider, now_unix)?;
+        fs::write(
+            self.root
+                .join(format!("{}.refresh-account", provider.source())),
+            serde_json::to_vec(&account)?,
+        )?;
+        Ok(())
+    }
+
+    pub fn last_refresh_account(&self, provider: Provider) -> Option<Option<String>> {
+        serde_json::from_slice(
+            &fs::read(
+                self.root
+                    .join(format!("{}.refresh-account", provider.source())),
+            )
+            .ok()?,
+        )
+        .ok()
     }
 
     pub fn now_unix() -> u64 {
@@ -811,6 +967,10 @@ impl CacheStore {
         self.root.join(LOW_QUOTA_ALERTED_FILE)
     }
 
+    fn icon_attention_path(&self) -> PathBuf {
+        self.root.join(ICON_ATTENTION_FILE)
+    }
+
     fn valid_watch_interval(seconds: u64) -> Option<u64> {
         (MIN_WATCH_INTERVAL_SECONDS..=MAX_WATCH_INTERVAL_SECONDS)
             .contains(&seconds)
@@ -861,6 +1021,34 @@ fn merge_session_windows(
     session_id: Option<&str>,
     quota_scope: Option<&str>,
 ) {
+    if snapshot.session_quota_only {
+        let previous = previous.filter(|previous| previous.session_quota_only);
+        if let Some(previous) = previous {
+            snapshot.session_windows = previous.session_windows.clone();
+        }
+        if let Some(id) = session_id {
+            // A statusLine tick that omits `five_hour` is not a report that the
+            // window is gone, so restore this session's own last reading before
+            // it becomes the session's stored quota. Without this the 5h row
+            // disappears until Claude Code emits the window again.
+            if let Some(previous_windows) =
+                previous.and_then(|previous| previous_windows_for_merge(previous, id, None))
+            {
+                let previous_windows = previous_windows.to_vec();
+                merge_omitted_window_list(
+                    &mut snapshot.windows,
+                    &previous_windows,
+                    snapshot.fetched_at_unix,
+                );
+            }
+            snapshot
+                .session_windows
+                .insert(id.to_string(), snapshot.windows.clone());
+        }
+        snapshot.session_quota_scopes.clear();
+        snapshot.quota_scope_windows.clear();
+        return;
+    }
     if let Some(previous) = previous {
         for (session_id, windows) in &previous.session_windows {
             snapshot
@@ -1131,11 +1319,59 @@ mod tests {
     }
 
     #[test]
+    fn icon_attention_round_trips_and_clears_when_empty() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        assert_eq!(cache.icon_attention(), IconAttention::default());
+        let mut attention = IconAttention::default();
+        attention.working.insert("w1:p1".into());
+        attention.unseen.insert("w1:p2".into());
+        cache.set_icon_attention(&attention).unwrap();
+        assert_eq!(cache.icon_attention(), attention);
+        cache.set_icon_attention(&IconAttention::default()).unwrap();
+        assert_eq!(cache.icon_attention(), IconAttention::default());
+        assert!(
+            directory.path().join("icon-attention.json").exists(),
+            "empty attention must stay on disk so hydrate does not re-run"
+        );
+    }
+
+    #[test]
     fn successful_snapshot_round_trips_through_atomic_cache() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         cache.save(&snapshot()).unwrap();
         assert_eq!(cache.load(Provider::Grok).unwrap(), Some(snapshot()));
+    }
+
+    #[test]
+    fn omp_upgrade_preserves_only_an_explicitly_confirmed_failed_account() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let target = BillingTarget::omp("anthropic");
+        let mut previous = snapshot();
+        previous.account_id = Some("old-pin".into());
+        cache.save_target(&target, &previous).unwrap();
+        let usage = crate::providers::omp::ProviderUsage {
+            oauth_without_usage_pins: vec![Some("old-pin".into())],
+            ..Default::default()
+        };
+        cache.save_omp_usage(&target, &usage).unwrap();
+        let migrated = cache.load_omp_usage(&target).unwrap();
+        assert_eq!(migrated.accounts.len(), 1);
+        assert_eq!(migrated.accounts[0].windows, previous.windows);
+        cache.save_omp_usage(&target, &usage).unwrap();
+        assert_eq!(cache.load_omp_usage(&target).unwrap(), migrated);
+        cache
+            .save_omp_usage(
+                &target,
+                &crate::providers::omp::ProviderUsage {
+                    oauth_without_usage_pins: vec![Some("new-pin".into())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cache.load_omp_usage(&target).unwrap().accounts.is_empty());
     }
 
     #[test]
@@ -2070,7 +2306,7 @@ mod tests {
     }
 
     #[test]
-    fn same_account_still_restores_an_omitted_five_hour_window() {
+    fn a_fresh_api_read_removes_legacy_unattributed_windows() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         cache
@@ -2086,10 +2322,7 @@ mod tests {
             .save_preserving_diagnostics_for_sessions(&mut latest, &[], Some(900))
             .unwrap();
         let saved = cache.load(Provider::Codex).unwrap().unwrap();
-        assert_eq!(
-            saved.window(WindowKind::FiveHour).unwrap().used_percent,
-            22.0
-        );
+        assert!(saved.window(WindowKind::FiveHour).is_none());
         assert_eq!(saved.window(WindowKind::Weekly).unwrap().used_percent, 66.0);
     }
 
@@ -2326,6 +2559,106 @@ mod tests {
         );
     }
 
+    /// A session-local (`session_quota_only`) statusLine observation is the
+    /// Claude path: a tick without `five_hour` must not strip the window from
+    /// the session's stored quota, or the 5h row disappears.
+    #[test]
+    fn session_local_statusline_observation_preserves_an_omitted_five_hour_window() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let payload = json!({"session_id": "session-1"});
+        cache
+            .save_statusline_observation(
+                Provider::Claude,
+                ProviderSnapshot::new(
+                    Provider::Claude,
+                    vec![
+                        UsageWindow::new(
+                            WindowKind::FiveHour,
+                            13.0,
+                            Some(ResetAt::from_unix_seconds(2_000)),
+                        )
+                        .unwrap(),
+                        UsageWindow::new(
+                            WindowKind::Weekly,
+                            20.0,
+                            Some(ResetAt::from_unix_seconds(10_000)),
+                        )
+                        .unwrap(),
+                    ],
+                    1_000,
+                )
+                .session_local(),
+                &payload,
+            )
+            .unwrap();
+
+        cache
+            .save_statusline_observation(
+                Provider::Claude,
+                ProviderSnapshot::new(
+                    Provider::Claude,
+                    vec![UsageWindow::new(
+                        WindowKind::Weekly,
+                        20.0,
+                        Some(ResetAt::from_unix_seconds(10_000)),
+                    )
+                    .unwrap()],
+                    1_100,
+                )
+                .session_local(),
+                &payload,
+            )
+            .unwrap();
+
+        let saved = cache
+            .load_statusline_observation(Provider::Claude)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            window_in(&saved.windows, WindowKind::FiveHour)
+                .unwrap()
+                .used_percent,
+            13.0
+        );
+        assert_eq!(
+            window_in(
+                saved.windows_for_session(Some("session-1")),
+                WindowKind::FiveHour
+            )
+            .unwrap()
+            .used_percent,
+            13.0
+        );
+
+        // The restore is bounded by the window's own reset: once the 5h period
+        // has elapsed the stale reading is dropped rather than carried forward.
+        cache
+            .save_statusline_observation(
+                Provider::Claude,
+                ProviderSnapshot::new(
+                    Provider::Claude,
+                    vec![UsageWindow::new(
+                        WindowKind::Weekly,
+                        20.0,
+                        Some(ResetAt::from_unix_seconds(10_000)),
+                    )
+                    .unwrap()],
+                    2_500,
+                )
+                .session_local(),
+                &payload,
+            )
+            .unwrap();
+        let saved = cache
+            .load_statusline_observation(Provider::Claude)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert!(window_in(&saved.windows, WindowKind::FiveHour).is_none());
+    }
+
     #[test]
     fn refresh_marker_debounces_only_within_interval() {
         let directory = tempdir().unwrap();
@@ -2404,7 +2737,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_layout_defaults_to_packed_and_persists_stacked() {
+    fn an_unset_sidebar_layout_file_round_trips_through_stacked() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         assert_eq!(cache.sidebar_layout(), None);

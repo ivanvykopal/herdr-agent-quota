@@ -56,7 +56,9 @@ pub fn fetch(key: &str) -> Result<ProviderSnapshot> {
     let value: Value = response
         .into_json()
         .context("decode OpenCode Go usage response")?;
-    parse_usage(&value, CacheStore::now_unix()).map_err(anyhow::Error::from)
+    parse_usage(&value, CacheStore::now_unix())
+        .map(|snapshot| snapshot.with_account_id(Some(super::credential_id(key))))
+        .map_err(anyhow::Error::from)
 }
 
 /// Build a snapshot from the deployed `usage.{rolling,weekly,monthly}` shape.

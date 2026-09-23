@@ -16,7 +16,11 @@ use std::process::Command;
 
 /// Herdr's integration id for a harness, when it has one.
 ///
-/// Agy reports through its statusLine instead, so it has no integration.
+/// Agy quota comes from the statusLine hook, not Herdr's session id. Herdr
+/// ships `antigravity-cli` for resume, but that id can be a subagent
+/// conversation and is not what statusLine keys quota by, so this plugin
+/// does not wait on it. Muse quota is account-level, so a Muse pane needs
+/// no session id to be attributed.
 fn integration_id(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::Claude => Some("claude"),
@@ -26,7 +30,8 @@ fn integration_id(harness: Harness) -> Option<&'static str> {
         Harness::Pi => Some("pi"),
         Harness::Omp => Some("omp"),
         Harness::Devin => Some("devin"),
-        Harness::Agy => None,
+        Harness::Cursor => Some("cursor"),
+        Harness::Agy | Harness::Muse => None,
     }
 }
 
@@ -143,6 +148,8 @@ grok: outdated (v0) (/home/u/.grok/hooks/herdr-agent-state.sh)
     #[test]
     fn session_backed_harnesses_report_their_integration_id() {
         assert_eq!(integration_id(Harness::Agy), None);
+        assert_eq!(integration_id(Harness::Muse), None);
+        assert_eq!(integration_id(Harness::Cursor), Some("cursor"));
         assert_eq!(integration_id(Harness::OpenCode), Some("opencode"));
         assert_eq!(integration_id(Harness::Pi), Some("pi"));
         assert_eq!(integration_id(Harness::Omp), Some("omp"));

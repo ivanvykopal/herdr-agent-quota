@@ -1,5 +1,7 @@
 pub mod agy;
 pub mod claude;
+pub mod cursor;
+pub mod font;
 pub mod grok;
 pub mod herdr;
 mod integration;
@@ -36,7 +38,7 @@ pub fn run(
 ) -> Result<()> {
     if apply || uninstall {
         std::env::var_os("HERDR_PLUGIN_STATE_DIR").context(
-            "configuration writes must run through Herdr so every collector uses the same cache; invoke herdr-agent-quota.configure or herdr-agent-quota.uninstall",
+            "configuration writes must run through Herdr so every collector uses the same cache; invoke herdr-agent-usage.configure or herdr-agent-usage.uninstall",
         )?;
     }
     if agents.is_empty() {
@@ -59,12 +61,16 @@ pub fn run(
         if agents.contains(&Harness::Claude) {
             claude::uninstall()?;
         }
+        if agents.contains(&Harness::Cursor) {
+            cursor::uninstall()?;
+        }
         // The rows on disk were written from these settings, so uninstall
         // needs them to recognise its own work and restore the backup.
         let fields = resolved_fields(None, Some(&cache));
         let brand = resolved_brand_colors(None, Some(&cache));
         herdr::uninstall(agents, full, fields, brand)?;
         if full {
+            font::uninstall(cache.root())?;
             // Herdr keeps this view until something clears it, so an uninstall
             // that skipped it would leave the panel sorted by a token this
             // plugin no longer publishes.
@@ -77,6 +83,7 @@ pub fn run(
             cache.clear_brand_colors()?;
             cache.clear_agent_order()?;
             cache.clear_low_quota_alert()?;
+            cache.clear_icon_attention()?;
             for name in prefs::ALL {
                 prefs::clear(name)?;
             }
@@ -117,8 +124,6 @@ pub fn run(
         cache.set_fields(fields)?;
         prefs::write(prefs::FIELDS, &fields.as_list())?;
         let brand = resolved_brand_colors(options.brand_colors, Some(&cache));
-        cache.set_brand_colors(brand)?;
-        prefs::write(prefs::BRAND_COLORS, brand.as_str())?;
         let alert = resolved_low_quota_alert(options.low_quota_alert, Some(&cache));
         // A new threshold has never warned about anything yet. Without this,
         // lowering it would stay silent for a provider already warned about at
@@ -129,6 +134,9 @@ pub fn run(
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
         herdr::apply(agents, layout, gap, fields, brand)?;
+        for note in font::install(cache.root())? {
+            println!("{note}");
+        }
         // Not gated on a full run, unlike the watcher: the Agent panel order
         // is a choice that arrives on this command line, and the settings pane
         // sends it alongside whatever agent selection the user happens to
@@ -146,6 +154,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Grok) {
             grok::apply()?;
+        }
+        if agents.contains(&Harness::Cursor) {
+            cursor::apply()?;
         }
         integration::report_missing(agents);
     } else {
@@ -169,6 +180,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Grok) {
             grok::check()?;
+        }
+        if agents.contains(&Harness::Cursor) {
+            cursor::check()?;
         }
         integration::report_missing(agents);
     }

@@ -1,6 +1,6 @@
 use herdr_agent_quota::model::{BillingTarget, ResetAt, WindowKind};
 use herdr_agent_quota::presentation::MetadataTokens;
-use herdr_agent_quota::providers::{agy, claude, codex, devin, grok, omp};
+use herdr_agent_quota::providers::{agy, claude, codex, cursor, devin, grok, muse, omp};
 use serde_json::Value;
 
 fn fixture(value: &str) -> Value {
@@ -85,10 +85,12 @@ fn claude_fixture_contains_both_subscription_windows() {
 }
 
 #[test]
-fn agy_fixture_aggregates_gemini_and_third_party_windows() {
-    let value = fixture(include_str!("fixtures/agy/statusline-both.json"));
+fn agy_fixture_requires_an_identifiable_pool() {
+    let mut value = fixture(include_str!("fixtures/agy/statusline-both.json"));
+    assert!(agy::parse_statusline(&value, 1).unwrap().windows.is_empty());
+    value["model"] = serde_json::json!({"display_name": "Gemini Flash"});
     let snapshot = agy::parse_statusline(&value, 1).unwrap();
-    assert_eq!(snapshot.windows.len(), 2);
+    assert_eq!(snapshot.windows.len(), 3);
     assert!(
         (snapshot
             .window(WindowKind::Weekly)
@@ -97,6 +99,13 @@ fn agy_fixture_aggregates_gemini_and_third_party_windows() {
             - 99.69)
             .abs()
             < 1e-9
+    );
+    assert_eq!(
+        snapshot
+            .window(WindowKind::Monthly)
+            .unwrap()
+            .display_label(),
+        "api"
     );
 }
 
@@ -198,5 +207,52 @@ fn devin_fixture_flips_remaining_to_used_for_daily_and_weekly() {
     assert_eq!(
         weekly.resets_at.map(|reset| reset.unix_seconds()),
         Some(1_788_681_600)
+    );
+}
+
+/// Recorded from a live Cursor `GetCurrentPeriodUsage` call. The CLI usage
+/// panel uses `totalPercentUsed` for Included when present, and
+/// `apiPercentUsed` for the named-model bar. Cycle end is Unix milliseconds.
+#[test]
+fn cursor_fixture_maps_included_and_api_the_way_the_cli_panel_does() {
+    let value = fixture(include_str!("fixtures/cursor/current-period-usage.json"));
+    let snapshot = cursor::parse_current_period_usage(&value, 1).expect("snapshot");
+    assert_eq!(snapshot.windows.len(), 3);
+    let auto = snapshot.window(WindowKind::FiveHour).expect("Auto window");
+    assert_eq!(auto.used_percent, 10.5);
+    assert_eq!(auto.display_label(), "at");
+    let api = snapshot.window(WindowKind::Weekly).expect("API window");
+    assert_eq!(api.used_percent, 40.0);
+    assert_eq!(api.display_label(), "api");
+    let monthly = snapshot.window(WindowKind::Monthly).expect("30d window");
+    assert!((monthly.used_percent - 7.165656565656565).abs() < 1e-9);
+    assert_eq!(monthly.display_label(), "30d");
+    assert_eq!(
+        monthly.resets_at.map(|reset| reset.unix_seconds()),
+        Some(1_790_950_387)
+    );
+}
+
+/// Recorded from a live Muse Code `POST /muse-code/key` call, with the API key
+/// and account identity removed. Only `subs_usage` is read.
+#[test]
+fn muse_fixture_maps_the_session_window_to_5h_and_weekly_to_7d() {
+    let value = fixture(include_str!("fixtures/muse/subscription-power.json"));
+    let snapshot = muse::parse_subscription(&value, 1).expect("snapshot");
+    assert_eq!(snapshot.windows.len(), 2);
+
+    let session = snapshot.window(WindowKind::FiveHour).expect("5h window");
+    assert_eq!(session.used_percent, 4.0);
+    assert_eq!(session.display_label(), "5h");
+    assert_eq!(
+        session.resets_at.map(|reset| reset.unix_seconds()),
+        Some(1_789_068_250)
+    );
+
+    let weekly = snapshot.window(WindowKind::Weekly).expect("weekly window");
+    assert_eq!(weekly.remaining_percent, 72.0);
+    assert_eq!(
+        weekly.resets_at.map(|reset| reset.unix_seconds()),
+        Some(1_789_344_000)
     );
 }

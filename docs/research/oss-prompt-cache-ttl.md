@@ -1,5 +1,7 @@
 # 高星开源项目如何判断 prompt cache 过期时间
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 研究日期：2026-08-30（Asia/Shanghai）  
 范围：按 GitHub 星数看用量/statusline/HUD 项目，以及各家官方 prompt-caching 合同。  
 问题：别人是怎么得到 `ttl≈58m` 这种倒计时的？有没有 Codex / Grok / Agy 可以照抄的做法？

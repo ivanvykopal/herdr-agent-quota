@@ -1,7 +1,8 @@
 use super::statusline::{settings_path, Adapter};
 use crate::cache::{CacheStore, DEFAULT_WATCH_INTERVAL_SECONDS};
 use crate::model::Provider;
-use crate::providers::claude::{parse_statusline, quota_scope_id};
+use crate::presentation::pace_segment;
+use crate::providers::claude::parse_statusline;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -14,10 +15,13 @@ const CONFIG: Adapter = Adapter {
 };
 
 pub fn check() -> Result<()> {
-    CONFIG.check(&settings_path(
-        "CLAUDE_SETTINGS_FILE",
-        ".claude/settings.json",
-    )?)
+    let cache = CacheStore::from_env()?;
+    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    CONFIG.check(
+        &settings_path("CLAUDE_SETTINGS_FILE", ".claude/settings.json")?,
+        cache.root(),
+        &executable,
+    )
 }
 
 pub fn apply() -> Result<()> {
@@ -70,13 +74,13 @@ pub fn uninstall_at(settings: &Path, state: &Path) -> Result<()> {
 pub fn run_statusline_hook() -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
+    let mut pace = None;
     if let Ok(mut value) = serde_json::from_slice::<Value>(&input) {
+        let now_unix = CacheStore::now_unix();
         // A gateway-routed session reports the routed model in its payload
         // (`model.id` is the gateway's id, not a `claude-*` one). Its
-        // `rate_limits` describe the gateway, not the Anthropic account the
-        // profile's quota tracks, so they must not enter the cache: the
-        // profile-canonical merge is monotonic on `resets_at` and a bogus
-        // far-future reset would poison every same-profile pane.
+        // `rate_limits` describe the gateway, not the Anthropic account, so
+        // they must not enter the cache or the pace segment.
         let gateway_model = gateway_model_id(&value).map(str::to_string);
         if gateway_model.is_some() {
             if let Some(object) = value.as_object_mut() {
@@ -84,7 +88,8 @@ pub fn run_statusline_hook() -> Result<()> {
                 object.remove("rateLimits");
             }
         }
-        if let Ok(mut snapshot) = parse_statusline(&value, CacheStore::now_unix()) {
+        if let Ok(mut snapshot) = parse_statusline(&value, now_unix) {
+            pace = pace_segment(&snapshot.windows, now_unix);
             // `display_name` is the logical Anthropic selection ("Opus 4.8"),
             // not what the gateway served. Record the served id and the
             // gateway marker here, so the hook and the transcript enrichment
@@ -99,19 +104,7 @@ pub fn run_statusline_hook() -> Result<()> {
             }
             if let Ok(cache) = CacheStore::from_env() {
                 let changed = observation_changed(&cache, &snapshot);
-                let quota_scope = quota_scope_id(
-                    std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
-                    crate::platform::home_dir()
-                        .as_deref()
-                        .map(std::path::Path::as_os_str),
-                    std::env::current_dir().ok().as_deref(),
-                );
-                let _ = cache.save_statusline_observation_with_quota_scope(
-                    Provider::Claude,
-                    snapshot,
-                    &value,
-                    quota_scope.as_deref(),
-                );
+                let _ = cache.save_statusline_observation(Provider::Claude, snapshot, &value);
                 if changed {
                     publish_in_background();
                 }
@@ -120,12 +113,20 @@ pub fn run_statusline_hook() -> Result<()> {
     }
     let cache = CacheStore::from_env()?;
     let Some(output) = CONFIG.run_previous(cache.root(), &input)? else {
+        if let Some(pace) = pace {
+            println!("{pace}");
+        }
         return Ok(());
     };
     if output.timed_out {
         return Ok(());
     }
-    std::io::stdout().write_all(&output.stdout)?;
+    let stdout = if output.exit_code == Some(0) {
+        append_pace(output.stdout, pace.as_deref())
+    } else {
+        output.stdout
+    };
+    std::io::stdout().write_all(&stdout)?;
     std::io::stdout().flush()?;
     if output.exit_code != Some(0) {
         std::process::exit(output.exit_code.unwrap_or(1));
@@ -154,12 +155,14 @@ fn publish_in_background() {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
         .args(["refresh", "--provider", "claude"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    crate::platform::detach(&mut command);
+    let _ = command.spawn();
 }
 
 /// The payload's model id when it names a non-Anthropic (gateway) model.
@@ -175,6 +178,26 @@ fn gateway_model_id(value: &Value) -> Option<&str> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .filter(|id| !crate::providers::claude::is_anthropic_model_id(id))
+}
+
+/// Add the pace to the end of the wrapped command's last line so the status
+/// line keeps whatever layout the user's own script produced.
+fn append_pace(mut stdout: Vec<u8>, pace: Option<&str>) -> Vec<u8> {
+    let Some(pace) = pace else {
+        return stdout;
+    };
+    let newline = stdout.ends_with(b"\n");
+    while stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    if !stdout.is_empty() {
+        stdout.push(b' ');
+    }
+    stdout.extend_from_slice(pace.as_bytes());
+    if newline {
+        stdout.push(b'\n');
+    }
+    stdout
 }
 
 #[cfg(test)]
@@ -203,5 +226,16 @@ mod tests {
         assert_eq!(gateway_model_id(&json!({"model": {"display_name": "Opus"}})), None);
         assert_eq!(gateway_model_id(&json!({"model": {"id": "  "}})), None);
         assert_eq!(gateway_model_id(&json!({})), None);
+    }
+
+    #[test]
+    fn pace_joins_the_last_status_line_and_keeps_the_trailing_newline() {
+        assert_eq!(
+            append_pace(b"a\nb\n".to_vec(), Some("⏱ 5h =")),
+            "a\nb ⏱ 5h =\n".as_bytes()
+        );
+        assert_eq!(append_pace(b"a".to_vec(), Some("x")), b"a x");
+        assert_eq!(append_pace(b"".to_vec(), Some("x")), b"x");
+        assert_eq!(append_pace(b"a\n".to_vec(), None), b"a\n");
     }
 }

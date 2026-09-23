@@ -10,6 +10,18 @@ fn pane_focus_uses_the_quota_only_focus_path() {
 }
 
 #[test]
+fn workspace_and_tab_focus_reach_the_focus_path() {
+    let manifest = include_str!("../herdr-plugin.toml");
+    for on in ["workspace.focused", "tab.focused"] {
+        let hook = manifest
+            .split("[[events]]")
+            .find(|event| event.contains(&format!("on = \"{on}\"")))
+            .expect("workspace and tab focus must be hooked");
+        assert!(hook.contains(" \"focus\"]"), "{on}: {hook}");
+    }
+}
+
+#[test]
 fn plugin_exposes_one_click_configure_and_uninstall_actions() {
     let manifest = include_str!("../herdr-plugin.toml");
     assert!(manifest.contains("id = \"configure\""));
@@ -67,9 +79,19 @@ fn the_settings_popup_is_tall_enough_for_every_option() {
         .trim()
         .parse()
         .unwrap();
-    // Three section headers, seven choices, seven fields, eight agents, four
+    // Three section headers, seven choices, every field, every agent, four
     // lines of TUI chrome, and the two rows consumed by Herdr's pane border.
-    assert!(height >= 3 + 7 + 7 + 8 + 4 + 2, "height = {height}");
+    // Walk the live lists so adding a harness or field without growing the
+    // popup is a test failure, not a row below the fold.
+    assert!(
+        height
+            >= 3 + 7
+                + herdr_agent_quota::cli::SidebarField::ALL.len()
+                + herdr_agent_quota::cli::AgentSelection::SUPPORTED.len()
+                + 4
+                + 2,
+        "height = {height}"
+    );
 }
 
 /// Herdr accepts a plugin-owned agent view only from `plugin:<manifest id>`
@@ -84,13 +106,9 @@ fn the_agent_view_source_matches_the_manifest_id() {
         .expect("the manifest declares an id")
         .trim()
         .trim_matches('"');
-    assert_eq!(id, "herdr-agent-quota");
-    let source = include_str!("../src/herdr.rs")
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("const AGENT_VIEW_SOURCE: &str = "))
-        .expect("the plugin declares an agent view source")
-        .trim()
-        .trim_end_matches(';')
-        .trim_matches('"');
-    assert_eq!(source, format!("plugin:{id}"));
+    assert_eq!(id, herdr_agent_quota::identity::PLUGIN_ID);
+    assert_eq!(
+        herdr_agent_quota::identity::agent_view_source(),
+        format!("plugin:{id}")
+    );
 }

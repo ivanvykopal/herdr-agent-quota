@@ -1,36 +1,43 @@
 # Security policy
 
-## Reporting a vulnerability
+## Reporting
 
-Report privately through
-[GitHub Security Advisories](https://github.com/levi-qiao/herdr-agent-quota/security/advisories/new).
-Please do not open a public issue for a vulnerability. Expect a first response
-within 7 days.
+Report vulnerabilities privately through
+[GitHub Security Advisories](https://github.com/levi-qiao/herdr-agent-usage/security/advisories/new).
+Do not include credentials in public issues. The expected initial response time
+is seven days. Security fixes target the latest release.
 
-## What this plugin touches
+## Data handling
 
-Useful context when judging impact:
+The plugin reads configured CLI credentials, local session metadata/transcripts,
+Claude/Agy StatusLine input, and Cursor CLI hook payloads (token counts and
+context-window fields only). Codex quota is obtained through its app-server;
+OMP quota through its usage CLI. OMP's credential database is never opened.
+Local SQLite reads are read-only and limited to session/model data, plus Cursor
+IDE's `state.vscdb` key `cursorAuth/accessToken` when the CLI has no login of
+its own and `$CURSOR_STATE_DB` is set (macOS never opens the default
+Cursor.app Application Support path). On macOS, Cursor Agent CLI and Muse Code both keep OAuth tokens in
+Keychain (`cursor-access-token` / `cursor-user`, and Muse
+`ai.meta.dev.credentials` / `meta`); the collector reads only those CLI items
+through `security find-generic-password`. Background processes never prompt:
+without a recorded approval marker the keychain branch is skipped outright, and
+the user approves once via `refresh --provider cursor --keychain-approve` or
+`refresh --provider muse --keychain-approve`. A successful token is kept in
+the process until that file changes or the quota API rejects it; it is never
+written to plugin state. Cursor credentials are never written, refreshed, or
+exchanged.
 
-- **Reads** `~/.grok/auth.json` (login key only), Devin CLI's
-  `credentials.toml` (API key only; never logged) and `config.json` (active
-  model), Claude Code and Agy statusLine JSON on stdin, and the local
-  `codex app-server` JSON-RPC socket.
-- **Writes** sanitized percentages to Herdr's plugin state directory,
-  `~/.config/herdr/config.toml`, `~/.claude/settings.json`, and
-  `~/.gemini/antigravity-cli/settings.json`. Active-turn coordination locks, a
-  configurable poll interval, and a temporary stop marker are also kept in
-  that plugin state directory. Older plugin-owned Grok hook files may be
-  removed during migration; user-owned hook content is never replaced.
-- **Sends** authenticated quota requests using each CLI's own contract: Grok's
-  billing endpoint, OpenCode Go's usage endpoint when a pane resolves to it,
-  and Devin CLI's Connect RPC `GetUserStatus`. No usage data is uploaded
-  anywhere else. API keys are never placed in logs, errors, or pane metadata.
-- **Never** refreshes, rotates, or writes a provider credential, and never
-  reads browser cookies or system keychains.
+Authenticated quota requests use the relevant CLI/provider's usage contract.
+The plugin sends no model prompts and does not upload usage to another service.
+It does not read browser cookies, other Keychain items, or manage provider
+logins. Invoked CLIs remain responsible for their own credential lifecycle.
 
-Credentials are held in memory for the duration of a single request and are
-never written to the cache or logged.
+Plugin state can contain quota, account/session identifiers, model and cache
+statistics, session summaries, preferences, and watcher coordination files.
+Herdr metadata can contain a short visible prompt topic. Credentials are never
+written to these files, logs, or pane metadata; credential-derived identifiers
+are hashed. Account IDs supplied by a CLI may be retained as identifiers.
 
-## Supported versions
-
-The latest release on `main`.
+Installation modifies only managed Herdr configuration and selected agents'
+hooks/integrations. User configuration is preserved or backed up for restoration;
+uninstall removes the selected plugin-owned settings and stops background work.

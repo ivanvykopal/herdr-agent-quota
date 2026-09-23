@@ -1,5 +1,7 @@
 # OMP Antigravity 的 `1d` 配额窗口：订阅与时间窗不是一回事
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 > 研究日期：2026-09-01（Asia/Shanghai）  
 > 目标：解释 `omp usage --json` 对 `google-antigravity` 输出
 > `window.durationMs = 86400000`（`1d`）的来源，并判断它是否意味着没有付费订阅。  

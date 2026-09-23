@@ -1,5 +1,7 @@
 # CodexBar / Grok 周限量读取研究
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 > 研究日期：2026-08-15（Asia/Shanghai）  
 > 复核版本：CodexBar `a0cecb1f1d08dbf26eb11a909dc976f5067030b5`（2026-08-14）；Grok Build `eb267feff13129e568df38fb6fdf0ceb65f735d6`（2026-08-13）。  
 > 目标：确认 CodexBar 为什么能显示 SuperGrok 周限量，并判断 Herdr Rust 插件能否在“不读浏览器 Cookie、不开常驻进程”的约束下复用。

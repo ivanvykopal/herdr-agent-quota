@@ -13,8 +13,8 @@
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, BrandColors, FieldSet, LowQuotaAlert, PercentStyle, SidebarField,
-    SidebarLayout, SidebarRowGap,
+    AgentOrder, AgentSelection, FieldSet, LowQuotaAlert, PercentStyle, SidebarField, SidebarLayout,
+    SidebarRowGap,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -44,7 +44,6 @@ enum Choice {
     Layout,
     RowGap,
     Interval,
-    Brand,
     Order,
     Alert,
 }
@@ -56,7 +55,6 @@ impl Choice {
             Self::Layout => "Sidebar layout",
             Self::RowGap => "Row gap",
             Self::Interval => "Watch interval",
-            Self::Brand => "Brand colors",
             Self::Order => "Agent order",
             Self::Alert => "Low quota alert",
         }
@@ -70,7 +68,6 @@ fn rows() -> Vec<Row> {
         Row::Choice(Choice::Layout),
         Row::Choice(Choice::RowGap),
         Row::Choice(Choice::Interval),
-        Row::Choice(Choice::Brand),
         Row::Choice(Choice::Order),
         Row::Choice(Choice::Alert),
         Row::Header("Fields"),
@@ -88,7 +85,6 @@ pub struct Settings {
     layout: SidebarLayout,
     gap: SidebarRowGap,
     interval_seconds: u64,
-    brand: BrandColors,
     order: AgentOrder,
     alert: LowQuotaAlert,
     fields: FieldSet,
@@ -113,7 +109,6 @@ impl Settings {
             interval_seconds: cache
                 .map(CacheStore::watch_interval_seconds)
                 .unwrap_or(crate::cache::DEFAULT_WATCH_INTERVAL_SECONDS),
-            brand: crate::configure::resolved_brand_colors(None, cache),
             order: crate::configure::resolved_agent_order(None, cache),
             alert: crate::configure::resolved_low_quota_alert(None, cache),
             fields: crate::configure::resolved_fields(None, cache),
@@ -127,10 +122,16 @@ impl Settings {
             Choice::Layout => self.layout.as_str().to_string(),
             Choice::RowGap => self.gap.to_string(),
             Choice::Interval => format_interval(self.interval_seconds),
-            Choice::Brand => self.brand.as_str().to_string(),
             Choice::Order => self.order.as_str().to_string(),
             Choice::Alert => self.alert.to_string(),
         }
+    }
+
+    /// Whether the sidebar Herdr is drawing has room for a meter at all.
+    /// Without one, `gauges` renders exactly as `stacked`, and the hint has
+    /// to say so rather than promise a bar the user will not see.
+    fn gauges_fit() -> bool {
+        crate::presentation::meter_cells(crate::configure::herdr::sidebar_width()).is_some()
     }
 
     fn choice_hint(self, choice: Choice) -> &'static str {
@@ -142,19 +143,19 @@ impl Settings {
             Choice::Layout => match self.layout {
                 SidebarLayout::Packed => "cache·ttl and 5h·7d share a row",
                 SidebarLayout::Stacked => "every field on its own row",
+                SidebarLayout::Gauges => match Self::gauges_fit() {
+                    true => "a meter beside each quota number",
+                    false => "sidebar too narrow: renders as stacked",
+                },
             },
             Choice::RowGap => match self.gap.as_u8() {
                 0 => "panes packed flush",
                 _ => "one blank row between panes",
             },
             Choice::Interval => "polled while an agent is working",
-            Choice::Brand => match self.brand {
-                BrandColors::On => "provider and model in agent hues",
-                BrandColors::Off => "severity colors only",
-            },
             Choice::Order => match self.order {
-                AgentOrder::Default => "Herdr sorts the agent panel",
-                AgentOrder::Quota => "least quota left at the top",
+                AgentOrder::Default => "Herdr's own policy",
+                AgentOrder::Quota => "by Space, least quota left first",
             },
             Choice::Alert => match self.alert.is_off() {
                 true => "no notification",
@@ -195,21 +196,18 @@ impl Settings {
                 }
             }
             Row::Choice(Choice::Layout) => {
-                self.layout = match self.layout {
-                    SidebarLayout::Packed => SidebarLayout::Stacked,
-                    SidebarLayout::Stacked => SidebarLayout::Packed,
-                }
+                let current = SidebarLayout::CHOICES
+                    .iter()
+                    .position(|value| *value == self.layout)
+                    .unwrap_or(0);
+                let count = SidebarLayout::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.layout = SidebarLayout::CHOICES[next as usize];
             }
             Row::Choice(Choice::RowGap) => {
                 self.gap = match self.gap.as_u8() {
                     0 => SidebarRowGap::SEPARATED,
                     _ => SidebarRowGap::FLUSH,
-                }
-            }
-            Row::Choice(Choice::Brand) => {
-                self.brand = match self.brand {
-                    BrandColors::On => BrandColors::Off,
-                    BrandColors::Off => BrandColors::On,
                 }
             }
             Row::Choice(Choice::Order) => {
@@ -258,15 +256,13 @@ impl Settings {
             "configure".to_string(),
             "--apply".to_string(),
             "--agent".to_string(),
-            agent_list(&self.agents()),
+            AgentSelection::as_cli_list(&self.agents()),
             "--quota-percent".to_string(),
             self.percent.as_str().to_string(),
             "--sidebar-layout".to_string(),
             self.layout.as_str().to_string(),
             "--row-gap".to_string(),
             self.gap.to_string(),
-            "--brand-colors".to_string(),
-            self.brand.as_str().to_string(),
             "--fields".to_string(),
             self.fields.as_list(),
             "--agent-order".to_string(),
@@ -292,26 +288,8 @@ impl Settings {
     }
 }
 
-fn agent_name(harness: Harness) -> &'static str {
-    match harness {
-        Harness::Claude => "claude",
-        Harness::Codex => "codex",
-        Harness::Grok => "grok",
-        Harness::Agy => "agy",
-        Harness::OpenCode => "opencode",
-        Harness::Pi => "pi",
-        Harness::Omp => "omp",
-        Harness::Devin => "devin",
-    }
-}
-
 fn agent_list(agents: &[Harness]) -> String {
-    agents
-        .iter()
-        .copied()
-        .map(agent_name)
-        .collect::<Vec<_>>()
-        .join(",")
+    AgentSelection::names(agents)
 }
 
 fn format_interval(seconds: u64) -> String {
@@ -433,7 +411,10 @@ fn apply(settings: Settings, removed: &[Harness]) -> Result<()> {
     }
     // A Herdr plugin action runs a fixed command line, so the agent selection
     // has to be stored where a later "Install / repair" will find it.
-    prefs::write(prefs::AGENTS, &agent_list(&settings.agents()))?;
+    prefs::write(
+        prefs::AGENTS,
+        &AgentSelection::as_stored_list(&settings.agents()),
+    )?;
     run_self(&executable, &settings.apply_arguments())?;
 
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
@@ -584,7 +565,7 @@ fn render_row(draft: &Settings, applied: Settings, row: Row, selected: bool) -> 
             format!(
                 "{cursor} {changed} {} {}\r\n",
                 checkbox(draft.has_agent(harness)),
-                agent_name(harness)
+                AgentSelection::harness_name(harness)
             )
         }
     }
@@ -613,11 +594,10 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             percent: PercentStyle::Remaining,
-            layout: SidebarLayout::Packed,
+            layout: SidebarLayout::Gauges,
             gap: SidebarRowGap::SEPARATED,
             interval_seconds: 60,
-            brand: BrandColors::On,
-            order: AgentOrder::Default,
+            order: AgentOrder::Quota,
             alert: LowQuotaAlert::OFF,
             fields: FieldSet::all(),
             agents: [true; AgentSelection::SUPPORTED.len()],
@@ -643,11 +623,30 @@ mod tests {
         assert_eq!(draft.percent, PercentStyle::Remaining);
 
         draft.cycle(Row::Choice(Choice::Layout), 1);
-        assert_eq!(draft.layout, SidebarLayout::Stacked);
+        assert_eq!(draft.layout, SidebarLayout::Packed);
         draft.cycle(Row::Choice(Choice::RowGap), 1);
         assert_eq!(draft.gap, SidebarRowGap::FLUSH);
-        draft.cycle(Row::Choice(Choice::Brand), 1);
-        assert_eq!(draft.brand, BrandColors::Off);
+    }
+
+    #[test]
+    fn the_layout_cycles_through_all_three_choices_in_both_directions() {
+        let mut draft = settings();
+        draft.cycle(Row::Choice(Choice::Layout), -1);
+        assert_eq!(draft.layout, SidebarLayout::Stacked);
+        draft.cycle(Row::Choice(Choice::Layout), 1);
+        assert_eq!(draft.layout, SidebarLayout::Gauges);
+        for _ in 0..SidebarLayout::CHOICES.len() {
+            draft.cycle(Row::Choice(Choice::Layout), 1);
+        }
+        assert_eq!(draft.layout, SidebarLayout::Gauges);
+
+        // The gauges hint is the longest of the three, so check it against the
+        // same width budget the frame test holds the other layouts to.
+        let frame = render(&draft, settings(), 2, 24, None);
+        assert!(frame.contains("gauges"), "{frame}");
+        for line in frame.trim_end_matches("\r\n").split("\r\n") {
+            assert!(line.chars().count() <= 70, "too wide: {line}");
+        }
     }
 
     #[test]
@@ -685,6 +684,8 @@ mod tests {
 
     /// Applying names every value, so it cannot inherit a stale preference,
     /// and it names the agents so a narrowed selection is what gets installed.
+    /// A complete selection is `all`, so a later provider is included without
+    /// rewriting the preference.
     #[test]
     fn applying_names_every_value_including_the_agent_selection() {
         let mut draft = settings();
@@ -697,24 +698,63 @@ mod tests {
                 "configure",
                 "--apply",
                 "--agent",
-                "claude,codex,grok,agy,opencode,omp,devin",
+                "claude,codex,grok,agy,opencode,omp,devin,muse,cursor",
                 "--quota-percent",
                 "used",
                 "--sidebar-layout",
-                "packed",
+                "gauges",
                 "--row-gap",
                 "1",
-                "--brand-colors",
-                "on",
                 "--fields",
-                "model,cache,ttl,context,5h,7d",
+                "provider,model,cache,ttl,context,5h,7d,30d",
                 "--agent-order",
-                "default",
+                "quota",
                 "--low-quota-alert",
                 "off",
                 "--watch-interval-seconds",
                 "60",
             ]
+        );
+    }
+
+    #[test]
+    fn the_declared_popup_height_fits_every_row() {
+        let manifest = include_str!("../herdr-plugin.toml");
+        let height: usize = manifest
+            .split("[[panes]]")
+            .find(|pane| pane.contains("id = \"settings\""))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("height = "))
+            .expect("the settings popup declares a height")
+            .trim()
+            .parse()
+            .unwrap();
+        // rows() is every option plus section headers. Reserve the four TUI
+        // chrome lines and Herdr's two-row pane border.
+        let needed = rows().len() + 4 + 2;
+        assert!(
+            height >= needed,
+            "height = {height}, need {needed} after adding a row"
+        );
+    }
+
+    #[test]
+    fn a_complete_selection_is_applied_as_all() {
+        let arguments = settings().apply_arguments();
+        let agent = arguments.iter().position(|flag| flag == "--agent").unwrap();
+        assert_eq!(arguments[agent + 1], "all");
+    }
+
+    #[test]
+    fn turning_the_newest_agent_off_is_an_exact_cli_list() {
+        let mut draft = settings();
+        draft.cycle(Row::Agent(Harness::Cursor), 1);
+        let arguments = draft.apply_arguments();
+        let agent = arguments.iter().position(|flag| flag == "--agent").unwrap();
+        assert_eq!(
+            arguments[agent + 1],
+            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
         );
     }
 
@@ -789,7 +829,7 @@ mod tests {
         draft.cycle(Row::Choice(Choice::Layout), 1);
         let frame = render(&draft, applied, 2, 24, Some("Nothing to apply."));
         assert!(frame.contains("> * Sidebar layout"), "{frame}");
-        assert!(frame.contains("stacked"), "{frame}");
+        assert!(frame.contains("packed"), "{frame}");
         assert!(!frame.contains("Agent quota settings"), "{frame}");
         // The frame ends in a line break, so the split leaves a trailing "".
         let lines: Vec<&str> = frame.trim_end_matches("\r\n").split("\r\n").collect();

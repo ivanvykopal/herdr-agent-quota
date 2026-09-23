@@ -1,5 +1,7 @@
 # Cache 命中率、TTL 与 context 可观测性调研
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 研究日期：2026-08-22（Asia/Shanghai）
 范围：本仓库的 Codex、Claude Code、Agy/Antigravity、Grok Build；同时检查了几个开源 statusline/HUD 实现。
 目标：找出可以在不发送模型请求、不重新登录、不 resume 活动会话的前提下显示的指标，并区分“可观测事实”和“本地估算”。

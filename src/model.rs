@@ -27,6 +27,12 @@ pub enum Provider {
     /// Quota reported by Devin CLI's Connect RPC API. A 1:1 harness→billing
     /// mapping like the original four, refreshed through `--provider all`.
     Devin,
+    /// Muse Code's subscription windows, read from the key call the CLI makes.
+    /// A 1:1 harness→billing mapping refreshed through `--provider all`.
+    Muse,
+    /// Cursor Agent CLI's included monthly pool, read from DashboardService.
+    /// A 1:1 harness→billing mapping refreshed through `--provider all`.
+    Cursor,
 }
 
 /// Quota collector identity. The original four keep the historical
@@ -36,12 +42,14 @@ pub type Billing = Provider;
 impl Provider {
     /// The collectors a bare `--provider all` refreshes. OpenCode Go is not
     /// here on purpose; see the variant's note.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Grok,
         Self::Claude,
         Self::Agy,
         Self::Devin,
+        Self::Muse,
+        Self::Cursor,
     ];
 
     /// Collectors fetched only for a pane that resolved to them.
@@ -61,6 +69,8 @@ impl Provider {
             Self::OpenCodeGo => "OpenCode Go",
             Self::Omp => "OMP",
             Self::Devin => "Devin",
+            Self::Muse => "Muse",
+            Self::Cursor => "Cursor",
         }
     }
 
@@ -75,6 +85,8 @@ impl Provider {
             Self::OpenCodeGo => "opencode-go.opencode-store",
             Self::Omp => "omp-usage",
             Self::Devin => "devin-cli-billing",
+            Self::Muse => "muse-code-subscription",
+            Self::Cursor => "cursor-dashboard-usage",
         }
     }
 }
@@ -92,6 +104,8 @@ pub enum Harness {
     Pi,
     Omp,
     Devin,
+    Muse,
+    Cursor,
 }
 
 impl Harness {
@@ -107,6 +121,8 @@ impl Harness {
             "pi" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
             "devin" | "devin-cli" => Some(Self::Devin),
+            "muse" | "muse-code" => Some(Self::Muse),
+            "cursor" | "cursor-agent" | "cursor-cli" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -120,6 +136,8 @@ impl Harness {
             Self::Claude => Some(Provider::Claude),
             Self::Agy => Some(Provider::Agy),
             Self::Devin => Some(Provider::Devin),
+            Self::Muse => Some(Provider::Muse),
+            Self::Cursor => Some(Provider::Cursor),
             Self::OpenCode | Self::Pi | Self::Omp => None,
         }
     }
@@ -556,6 +574,11 @@ impl CacheUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
+    /// StatusLine quota has no serving-account proof and is session-local.
+    /// False on old caches so they can be refreshed without trusting shared
+    /// profile windows from an earlier plugin version.
+    #[serde(default)]
+    pub session_quota_only: bool,
     pub provider: Provider,
     pub source: String,
     pub fetched_at_unix: u64,
@@ -580,23 +603,16 @@ pub struct ProviderSnapshot {
     /// pane's local rollout usage.
     #[serde(default)]
     pub session_contexts: BTreeMap<String, ContextUsage>,
-    /// Account quota windows keyed by the provider's session id.
-    ///
-    /// Quota itself is account-level for every provider. Grok and Codex fetch
-    /// one login's windows and leave this map empty. StatusLine providers
-    /// (Claude, Agy) can run two signed-in accounts into one cache file, and
-    /// the top-level `windows` field only holds whichever account ticked last;
-    /// those ticks are stored here so a pane can read its own account.
-    ///
-    /// Claude also records an opaque profile scope per session. When that
-    /// mapping exists, [`Self::windows_for_session`] prefers the profile's
-    /// latest windows over this legacy per-session copy. Agy has no equivalent
-    /// profile identity and keeps using this map.
+    /// StatusLine quota observations keyed by the exact provider session ID.
+    /// Direct API collectors leave this map empty. Claude and Agy snapshots
+    /// keep these windows conversation-local: Agy's gemini/3p allowance is an
+    /// account pool, but which pool applies is selected by that conversation's
+    /// active model. An unmatched Agy Herdr id may use a stored conversation
+    /// only when exactly one conversation is observable.
     #[serde(default)]
     pub session_windows: BTreeMap<String, Vec<UsageWindow>>,
-    /// Opaque Claude profile identity for a session. The value is a SHA-256
-    /// hex digest of the normalized config directory; the raw path is never
-    /// stored.
+    /// Legacy Claude profile digests retained for cache format compatibility.
+    /// Current session-local observations clear this map during migration.
     #[serde(default)]
     pub session_quota_scopes: BTreeMap<String, String>,
     /// Claude sessions whose transcript shows a non-Anthropic served model.
@@ -608,8 +624,7 @@ pub struct ProviderSnapshot {
     /// anything else (`glm-5.3`, `kimi-k3`, …) is gateway-served.
     #[serde(default)]
     pub session_gateway_routed: BTreeMap<String, ()>,
-    /// Latest quota windows for a Claude profile scope. Sessions that map to
-    /// the same scope share this canonical reading.
+    /// Legacy profile-shared windows; not trusted by current StatusLine data.
     #[serde(default)]
     pub quota_scope_windows: BTreeMap<String, Vec<UsageWindow>>,
     /// Login identity the snapshot was fetched for (Grok `user_id`, Codex
@@ -623,6 +638,7 @@ pub struct ProviderSnapshot {
 impl ProviderSnapshot {
     pub fn new(provider: Provider, windows: Vec<UsageWindow>, fetched_at_unix: u64) -> Self {
         Self {
+            session_quota_only: false,
             provider,
             source: provider.source().to_string(),
             fetched_at_unix,
@@ -645,28 +661,86 @@ impl ProviderSnapshot {
         self
     }
 
+    pub fn session_local(mut self) -> Self {
+        self.session_quota_only = true;
+        self
+    }
+
     pub fn with_model(mut self, model: Option<String>) -> Self {
         self.model = model;
         self
     }
 
+    /// The only provider session represented by the session-local maps.
+    ///
+    /// Antigravity's PreInvocation hook may report a spawned subagent
+    /// conversation while statusLine continues to describe the parent TUI
+    /// conversation. Bridging that mismatch is safe only when all retained Agy
+    /// diagnostics point at one conversation. Two distinct ids are ambiguous
+    /// and deliberately return `None` rather than borrowing the latest pane.
+    fn only_observed_session(&self) -> Option<&str> {
+        let mut only = None;
+        for id in self
+            .session_windows
+            .keys()
+            .chain(self.session_models.keys())
+            .chain(self.session_contexts.keys())
+        {
+            let id = id.as_str();
+            match only {
+                None => only = Some(id),
+                Some(current) if current == id => {}
+                Some(_) => return None,
+            }
+        }
+        only
+    }
+
+    /// Resolve the session key used by per-session diagnostics.
+    ///
+    /// Non-Agy providers keep their exact existing lookup. Agy first honors an
+    /// exact statusLine conversation id. If Herdr supplied a different
+    /// subagent id, it may bridge to the sole observed conversation; once two
+    /// conversations are present, the mismatch fails closed.
+    fn session_for_lookup<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
+        if self.provider != Provider::Agy {
+            return Some(session_id);
+        }
+        if self.session_windows.contains_key(session_id)
+            || self.session_models.contains_key(session_id)
+            || self.session_contexts.contains_key(session_id)
+        {
+            return Some(session_id);
+        }
+        self.only_observed_session()
+    }
+
     /// Return the model for a pane's session.
     ///
-    /// A known Claude/Agy/Codex/Grok session never borrows the provider-level
+    /// A known Claude/Codex/Grok session never borrows the provider-level
     /// value, because that may belong to another pane. Devin populates
     /// `session_models` from `sessions.db`, so a pane whose session id is found
     /// in the DB gets its per-session active model. A pane without a
     /// `session_models` entry — a brand-new session, or one whose id is not in
     /// the DB — falls back to `snapshot.model`, the `config.json` default.
+    /// Agy may use the latest model only when every retained observation
+    /// points at this same conversation. An exact hit in `session_windows`
+    /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
             return self.model.as_deref();
         };
+        let session_id = self.session_for_lookup(session_id)?;
         if let Some(model) = self.session_models.get(session_id) {
             return Some(model);
         }
         match self.provider {
-            Provider::Devin => self.model.as_deref(),
+            // A Muse session with no completed model call yet runs the
+            // `settings.json` default, like a fresh Devin session.
+            Provider::Devin | Provider::Muse | Provider::Cursor => self.model.as_deref(),
+            Provider::Agy if self.only_observed_session() == Some(session_id) => {
+                self.model.as_deref()
+            }
             _ => None,
         }
     }
@@ -674,37 +748,54 @@ impl ProviderSnapshot {
     /// Return context/cache diagnostics for a pane's session. A known session
     /// never falls back to provider-level data, because an older snapshot may
     /// belong to another pane. The global value is used only when the caller
-    /// has no session id at all.
+    /// has no session id at all. Agy may use the latest context only when
+    /// every retained observation points at this same conversation.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
             return self.context.as_ref();
         };
+        let session_id = self.session_for_lookup(session_id)?;
         if let Some(context) = self.session_contexts.get(session_id) {
             return Some(context);
         }
-        None
+        match self.provider {
+            Provider::Agy if self.only_observed_session() == Some(session_id) => {
+                self.context.as_ref()
+            }
+            _ => None,
+        }
     }
 
     /// Return the quota windows for a pane's session.
     ///
-    /// Context and model are session-local, so a known session never falls
-    /// back to the provider-level value. Quota is account-level: Grok, Codex,
-    /// and Devin share one login's windows across every pane, and the keyed
-    /// maps stay empty for them.
+    /// Context and model are session-local. Grok, Codex, and Devin have
+    /// provider-level quota windows. Claude and Agy statusLine windows stay
+    /// keyed by conversation: Agy's quota belongs to the account, but the
+    /// active conversation's model selects the gemini or 3p pool.
     ///
     /// Lookup order:
-    /// 1. No session id → top-level `windows`.
-    /// 2. Session has a Claude profile scope with canonical windows → those.
-    /// 3. Session has legacy `session_windows` → those (Agy, old cache).
-    /// 4. Every keyed map is empty → top-level `windows` (Grok/Codex/Devin
-    ///    and a StatusLine cache written before session maps existed).
-    /// 5. Session unknown, but exactly one profile scope has quota → that
-    ///    scope's windows. One scope means one account on this machine, so an
-    ///    unrecorded pane provably belongs to it (a freshly started pane, or
-    ///    one Herdr names before its first StatusLine hook run).
-    /// 6. Session unknown and two or more scopes exist → empty. The account is
-    ///    ambiguous and a missing session must not borrow another's numbers.
+    /// 1. Agy with no Herdr session id → latest top-level statusLine windows.
+    /// 2. Session-local snapshot → exact session windows; Agy may bridge an
+    ///    unmatched subagent id only when exactly one conversation is stored.
+    /// 3. Session has a legacy Claude profile scope → canonical scope windows.
+    /// 4. Session has legacy `session_windows` → those.
+    /// 5. Every keyed map is empty → top-level windows (Grok/Codex/Devin and a
+    ///    StatusLine cache written before session maps existed).
+    /// 6. Keyed maps exist but this session is unknown → empty.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
+        if self.provider == Provider::Agy && session_id.is_none() {
+            return &self.windows;
+        }
+        if self.session_quota_only {
+            let Some(session_id) = session_id.and_then(|id| self.session_for_lookup(id)) else {
+                return &[];
+            };
+            return self
+                .session_windows
+                .get(session_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+        }
         let Some(session_id) = session_id else {
             return &self.windows;
         };
@@ -727,19 +818,6 @@ impl ProviderSnapshot {
         {
             return &self.windows;
         }
-        // A pane whose session the StatusLine collector has not recorded yet
-        // (a freshly started pane, or one whose id Herdr reports before the
-        // first hook run) is unknown to every keyed map. When exactly one
-        // profile scope has quota there is a single account on this machine,
-        // so the pane provably belongs to it: show that account's windows
-        // instead of a bare `N/A`. This is the same account-level sharing the
-        // known same-profile panes already get; with two or more scopes the
-        // account is ambiguous and the conservative empty result stands.
-        if self.quota_scope_windows.len() == 1 {
-            if let Some(windows) = self.quota_scope_windows.values().next() {
-                return windows;
-            }
-        }
         &[]
     }
 
@@ -761,10 +839,17 @@ impl ProviderSnapshot {
         current_account_id: Option<&str>,
         credentials_mtime_unix: Option<u64>,
     ) -> bool {
+        if matches!(self.provider, Provider::Claude | Provider::Agy)
+            && self.account_id.is_none()
+            && !self.session_quota_only
+        {
+            return false;
+        }
         match (self.account_id.as_deref(), current_account_id) {
             (Some(saved), Some(current)) => saved == current,
             (Some(_), None) => false,
-            (None, Some(_)) | (None, None) => {
+            (None, Some(_)) => false,
+            (None, None) => {
                 credentials_mtime_unix.is_none_or(|mtime| mtime <= self.fetched_at_unix)
             }
         }
@@ -772,6 +857,32 @@ impl ProviderSnapshot {
 
     pub fn window(&self, kind: WindowKind) -> Option<&UsageWindow> {
         window_in(&self.windows, kind)
+    }
+
+    /// True when a stored quota window's reset is now in the past.
+    ///
+    /// Missing reset times cannot be proved expired, so they do not qualify.
+    /// An empty window list is "no quota", not a lapsed window. Provider
+    /// fetches use this; a pane uses [`Self::displayed_quota_has_expired`].
+    pub fn has_expired_quota(&self, now_unix: u64) -> bool {
+        quota_windows_expired(&self.windows, now_unix)
+            || self
+                .session_windows
+                .values()
+                .any(|windows| quota_windows_expired(windows, now_unix))
+            || self
+                .quota_scope_windows
+                .values()
+                .any(|windows| quota_windows_expired(windows, now_unix))
+    }
+
+    /// True when the windows this pane would render have already reset.
+    ///
+    /// Codex/Grok/Devin share provider-level windows. Claude keys windows by
+    /// session. Agy uses an exact or unambiguous statusLine conversation, so an
+    /// unrelated Agy pane cannot make this pane inherit a different pool.
+    pub fn displayed_quota_has_expired(&self, session_id: Option<&str>, now_unix: u64) -> bool {
+        quota_windows_expired(self.windows_for_session(session_id), now_unix)
     }
 
     /// Keep a previously observed quota window when the latest payload omits
@@ -803,13 +914,14 @@ impl ProviderSnapshot {
     ) -> Severity {
         let live = live_windows(windows, now_unix);
         let relevant = match provider {
-            Provider::Grok => long_window(&live),
+            Provider::Grok | Provider::Cursor => long_window(&live),
             Provider::Codex
             | Provider::Claude
             | Provider::Agy
             | Provider::OpenCodeGo
             | Provider::Omp
-            | Provider::Devin => {
+            | Provider::Devin
+            | Provider::Muse => {
                 window_in(&live, WindowKind::FiveHour).or_else(|| long_window(&live))
             }
         };
@@ -817,6 +929,10 @@ impl ProviderSnapshot {
             .map(|window| Severity::for_window(window, now_unix))
             .unwrap_or(Severity::Unknown)
     }
+}
+
+fn quota_windows_expired(windows: &[UsageWindow], now_unix: u64) -> bool {
+    windows.iter().any(|window| !window.is_current(now_unix))
 }
 
 pub(crate) fn window_in(windows: &[UsageWindow], kind: WindowKind) -> Option<&UsageWindow> {
@@ -932,7 +1048,23 @@ impl Severity {
     pub fn for_window(window: &UsageWindow, _now_unix: u64) -> Self {
         // Remaining quota only. Three sidebar bands so packed 5h/7d rows
         // do not mix two nearby greens. Classify the rounded integer shown.
-        let displayed_remaining = window.remaining_percent.round();
+        Self::for_headroom(window.remaining_percent)
+    }
+
+    /// Headroom left in the context window, on the same bands as
+    /// [`Self::for_window`] — a sidebar row means the same thing whichever
+    /// row it is.
+    ///
+    /// Never `Unknown`: a context row exists only when a percent was read.
+    pub fn for_context_remaining(remaining_percent: f64) -> Self {
+        Self::for_headroom(remaining_percent)
+    }
+
+    /// The one band table every sidebar row is coloured by. Classify the
+    /// rounded integer, so a row's colour and its printed number can never
+    /// disagree at a threshold.
+    fn for_headroom(remaining_percent: f64) -> Self {
+        let displayed_remaining = remaining_percent.round();
         if displayed_remaining >= 50.0 {
             Self::Normal
         } else if displayed_remaining >= 20.0 {
@@ -944,7 +1076,24 @@ impl Severity {
 }
 
 pub fn format_percent(value: f64) -> String {
-    format!("{value:.0}")
+    let rounded = format!("{value:.0}");
+    // `{:.0}` rounds 99.5–99.9 to 100. Agy gemini-5h at remaining_fraction
+    // 0.9986 then paints a full bar while headroom (floored) is already 99.
+    if value < 100.0 && rounded == "100" {
+        "99".to_string()
+    } else {
+        rounded
+    }
+}
+
+/// The whole number the sidebar prints, for callers that must agree with it —
+/// the gauges meter derives its cell count from this.
+///
+/// Read back out of [`format_percent`] rather than rounded again: `{:.0}`
+/// rounds half to even while `f64::round` rounds half away from zero, so an
+/// exactly-reachable 18.5% would otherwise draw a two-cell bar beside `18%`.
+pub fn printed_percent(value: f64) -> u32 {
+    format_percent(value).parse().unwrap_or(0)
 }
 
 #[derive(Debug, Error)]
@@ -968,6 +1117,18 @@ mod tests {
         let value = window(WindowKind::Weekly, 42.5);
         assert_eq!(value.remaining_percent, 57.5);
         assert_eq!(format_percent(value.remaining_percent), "58");
+        assert_eq!(
+            format_percent(window(WindowKind::FiveHour, 0.14411).remaining_percent),
+            "99"
+        );
+    }
+
+    #[test]
+    fn format_percent_does_not_round_a_partial_pool_up_to_full() {
+        assert_eq!(format_percent(99.85589), "99");
+        assert_eq!(format_percent(99.5), "99");
+        assert_eq!(format_percent(100.0), "100");
+        assert_eq!(format_percent(0.0), "0");
     }
 
     #[test]
@@ -1041,8 +1202,8 @@ mod tests {
     fn legacy_snapshot_is_dropped_when_credentials_are_newer_than_the_fetch() {
         let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 100);
         assert!(!snapshot.usable_for_account(Some("account-b"), Some(150)));
-        assert!(snapshot.usable_for_account(Some("account-b"), Some(100)));
-        assert!(snapshot.usable_for_account(Some("account-b"), Some(50)));
+        assert!(!snapshot.usable_for_account(Some("account-b"), Some(100)));
+        assert!(!snapshot.usable_for_account(Some("account-b"), Some(50)));
         assert!(!snapshot.usable_for_account(None, Some(150)));
         assert!(snapshot.usable_for_account(None, Some(50)));
     }
@@ -1098,6 +1259,33 @@ mod tests {
         ] {
             let window = UsageWindow::new(WindowKind::Weekly, used_percent, Some(reset)).unwrap();
             assert_eq!(Severity::for_window(&window, now), expected);
+        }
+    }
+
+    /// Context severity reads headroom, exactly like a window's: it bands on
+    /// the context left, so every sidebar row means the same thing.
+    #[test]
+    fn context_severity_is_thresholded_on_remaining_at_fifty_and_twenty() {
+        for (used_percent, expected) in [
+            (0.0, Severity::Normal),
+            (31.0, Severity::Normal),
+            (49.0, Severity::Normal),
+            (49.4, Severity::Normal),
+            (50.0, Severity::Normal),
+            (51.0, Severity::Warning),
+            (53.0, Severity::Warning),
+            (79.0, Severity::Warning),
+            (79.4, Severity::Warning),
+            (80.0, Severity::Warning),
+            (81.0, Severity::Danger),
+            (85.0, Severity::Danger),
+            (100.0, Severity::Danger),
+        ] {
+            assert_eq!(
+                Severity::for_context_remaining(100.0 - used_percent),
+                expected,
+                "{used_percent} used"
+            );
         }
     }
 
@@ -1203,7 +1391,11 @@ mod tests {
         );
         assert_eq!(Harness::billing_for_agent("opencode"), None);
         assert_eq!(Harness::billing_for_agent("pi"), None);
-        assert_eq!(Harness::billing_for_agent("cursor"), None);
+        assert_eq!(Harness::billing_for_agent("cursor"), Some(Provider::Cursor));
+        assert_eq!(
+            Harness::billing_for_agent("cursor-agent"),
+            Some(Provider::Cursor)
+        );
         assert_eq!(
             Harness::billing_for_agent("claude-code"),
             Some(Provider::Claude)
@@ -1218,6 +1410,11 @@ mod tests {
         assert_eq!(
             Harness::billing_for_agent("devin-cli"),
             Some(Provider::Devin)
+        );
+        assert_eq!(Harness::billing_for_agent("muse"), Some(Provider::Muse));
+        assert_eq!(
+            Harness::billing_for_agent("muse-code"),
+            Some(Provider::Muse)
         );
     }
 
@@ -1401,6 +1598,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_with_windows_does_not_borrow_provider_model_or_context() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+            0,
+        )
+        .session_local()
+        .with_model(Some("Opus".to_string()))
+        .with_context(Some(ContextUsage::new(40.0).unwrap()));
+        snapshot.session_windows.insert(
+            "session-1".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "session-2".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("session-2".to_string(), "Opus".to_string());
+        snapshot
+            .session_contexts
+            .insert("session-2".to_string(), ContextUsage::new(40.0).unwrap());
+
+        assert_eq!(snapshot.model_for_session(Some("session-1")), None);
+        assert!(snapshot.context_for_session(Some("session-1")).is_none());
+        assert_eq!(snapshot.model_for_session(Some("session-2")), Some("Opus"));
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("session-2"))
+                .map(|context| context.used_percent),
+            Some(40.0)
+        );
+    }
+
+    #[test]
     fn devin_new_session_without_model_switch_uses_config_default() {
         let mut snapshot = ProviderSnapshot::new(Provider::Devin, vec![], 0)
             .with_model(Some("SWE-1.7 Medium".to_string()));
@@ -1494,6 +1727,199 @@ mod tests {
     }
 
     #[test]
+    fn agy_subagent_id_uses_the_only_observed_statusline_conversation() {
+        // Live failure: statusLine keys the parent conversation while Herdr's
+        // PreInvocation hook can report a spawned DeepCoderWorkerL0 id. With
+        // one observed Agy conversation the attribution is unambiguous.
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 0.14411, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
+        snapshot.session_windows.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            snapshot.windows.clone(),
+        );
+        snapshot.session_models.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            "Gemini 3.8 Flash (High)".to_string(),
+        );
+        snapshot.context = Some(ContextUsage::new(3.427886962890625).unwrap());
+        snapshot.session_contexts.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            ContextUsage::new(3.427886962890625).unwrap(),
+        );
+
+        let herdr_id = "6a4d6f77-88be-4704-adcc-a51401ad7c03";
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some(herdr_id))
+                .first()
+                .unwrap()
+                .used_percent,
+            0.14411
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some(herdr_id)),
+            Some("Gemini 3.8 Flash (High)")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some(herdr_id))
+                .map(|context| context.used_percent),
+            Some(3.427886962890625)
+        );
+    }
+
+    #[test]
+    fn agy_unknown_subagent_does_not_borrow_when_two_conversations_exist() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Claude Sonnet".to_string()))
+        .with_context(Some(ContextUsage::new(70.0).unwrap()));
+        snapshot.session_windows.insert(
+            "parent-gemini".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "parent-claude".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("parent-gemini".to_string(), "Gemini Flash".to_string());
+        snapshot
+            .session_models
+            .insert("parent-claude".to_string(), "Claude Sonnet".to_string());
+        snapshot.session_contexts.insert(
+            "parent-gemini".to_string(),
+            ContextUsage::new(20.0).unwrap(),
+        );
+        snapshot.session_contexts.insert(
+            "parent-claude".to_string(),
+            ContextUsage::new(70.0).unwrap(),
+        );
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("parent-gemini"))
+                .first()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("parent-gemini")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("parent-gemini"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
+
+        assert!(snapshot
+            .windows_for_session(Some("unknown-subagent"))
+            .is_empty());
+        assert_eq!(snapshot.model_for_session(Some("unknown-subagent")), None);
+        assert!(snapshot
+            .context_for_session(Some("unknown-subagent"))
+            .is_none());
+    }
+
+    #[test]
+    fn agy_windows_hit_does_not_borrow_another_panes_model_or_context() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Claude Sonnet".to_string()))
+        .with_context(Some(ContextUsage::new(70.0).unwrap()));
+        snapshot.session_windows.insert(
+            "w1:p1".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "w1:p2".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("w1:p2".to_string(), "Claude Sonnet".to_string());
+        snapshot
+            .session_contexts
+            .insert("w1:p2".to_string(), ContextUsage::new(70.0).unwrap());
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("w1:p1"))
+                .first()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        assert_eq!(snapshot.model_for_session(Some("w1:p1")), None);
+        assert!(snapshot.context_for_session(Some("w1:p1")).is_none());
+
+        assert_eq!(
+            snapshot.model_for_session(Some("w1:p2")),
+            Some("Claude Sonnet")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("w1:p2"))
+                .map(|context| context.used_percent),
+            Some(70.0)
+        );
+    }
+
+    #[test]
+    fn agy_single_observation_may_use_latest_model_when_session_maps_miss() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Gemini Flash".to_string()))
+        .with_context(Some(ContextUsage::new(20.0).unwrap()));
+        snapshot.session_windows.insert(
+            "w1:p7".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+
+        assert_eq!(
+            snapshot.model_for_session(Some("w1:p7")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("w1:p7"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("unknown-subagent")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("unknown-subagent"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
+    }
+
+    #[test]
     fn claude_profile_scope_shares_the_latest_quota_across_sessions() {
         let mut snapshot = ProviderSnapshot::new(
             Provider::Claude,
@@ -1579,35 +2005,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecorded_pane_inherits_the_only_profile_scope_quota() {
-        // A single Anthropic account: one profile scope holds the quota, and
-        // known sessions (any model, including third-party routes) already
-        // share it. A pane whose session the StatusLine collector has not yet
-        // recorded must inherit the same account quota rather than show N/A.
-        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 1);
-        snapshot
-            .session_quota_scopes
-            .insert("recorded".to_string(), "scope-w".to_string());
-        snapshot.session_windows.insert(
-            "recorded".to_string(),
-            vec![quota_window(WindowKind::Weekly, 27.0, 10_000)],
-        );
-        snapshot.quota_scope_windows.insert(
-            "scope-w".to_string(),
-            vec![quota_window(WindowKind::Weekly, 27.0, 10_000)],
-        );
-
-        assert_eq!(
-            snapshot
-                .windows_for_session(Some("not-yet-recorded"))
-                .first()
-                .unwrap()
-                .used_percent,
-            27.0
-        );
-    }
-
-    #[test]
     fn legacy_snapshots_deserialize_without_quota_scope_maps() {
         let snapshot: ProviderSnapshot = serde_json::from_str(
             r#"{
@@ -1644,5 +2041,42 @@ mod tests {
         assert!(UsageWindow::new(WindowKind::FiveHour, 20.0, None)
             .unwrap()
             .is_current(1_001));
+    }
+
+    #[test]
+    fn a_snapshot_has_expired_quota_only_when_a_reset_is_in_the_past() {
+        let live = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![
+                quota_window(WindowKind::FiveHour, 96.0, 2_000),
+                quota_window(WindowKind::Weekly, 48.0, 10_000),
+            ],
+            1_000,
+        );
+        assert!(!live.has_expired_quota(1_999));
+        let expired = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![
+                quota_window(WindowKind::FiveHour, 96.0, 1_000),
+                quota_window(WindowKind::Weekly, 48.0, 10_000),
+            ],
+            900,
+        );
+        assert!(expired.has_expired_quota(1_000));
+        let undated = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![UsageWindow::new(WindowKind::Weekly, 48.0, None).unwrap()],
+            1_000,
+        );
+        assert!(!undated.has_expired_quota(5_000));
+        assert!(!ProviderSnapshot::new(Provider::Codex, vec![], 1_000).has_expired_quota(5_000));
+        let mut session = ProviderSnapshot::new(Provider::Claude, vec![], 1_000);
+        session.session_windows.insert(
+            "s1".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 90.0, 1_000)],
+        );
+        assert!(session.has_expired_quota(1_001));
+        assert!(session.displayed_quota_has_expired(Some("s1"), 1_001));
+        assert!(!session.displayed_quota_has_expired(Some("other"), 1_001));
     }
 }

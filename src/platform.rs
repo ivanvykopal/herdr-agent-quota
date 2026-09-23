@@ -58,6 +58,48 @@ pub fn shell_quote(path: &std::path::Path) -> String {
     }
 }
 
+/// Prepare a command for a background child that must outlive its parent.
+///
+/// Windows children inherit every inheritable handle of the parent, even
+/// with `Stdio::null()`. Herdr (and Claude's statusLine runner) hand this
+/// process inheritable pipes as stdio and wait for them to close, so a
+/// watcher that inherited them would keep a finished action "running" and
+/// stall the statusLine until it exited. Our own stdio is made
+/// non-inheritable first, and the child gets no console window.
+/// Unix callers already detach with `setsid`/`Stdio::null()`.
+pub fn detach(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 0x1;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            if !handle.is_null() {
+                // SAFETY: clearing the inherit flag on this process's own
+                // std handles; failure only means the handle stays inheritable.
+                unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// Kill a spawned process and every descendant it started.
 ///
 /// Unix callers put the child in its own process group and signal the

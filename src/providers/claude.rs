@@ -3,90 +3,11 @@ use crate::model::{ContextUsage, Provider, ProviderSnapshot, ResetAt, UsageWindo
 use crate::providers::statusline::{parse_context, parse_model};
 use crate::providers::ProviderError;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-/// Opaque Claude profile identity used to share quota across sessions.
-///
-/// Claude Code's `CLAUDE_CONFIG_DIR` is the profile root for credentials and
-/// session history. The cache stores only a SHA-256 hex digest of the
-/// normalized path, never the path itself.
-pub fn quota_scope_id(
-    claude_config_dir: Option<&OsStr>,
-    home: Option<&OsStr>,
-    current_dir: Option<&Path>,
-) -> Option<String> {
-    let config_dir = claude_config_dir.filter(|value| !value.is_empty());
-    let home_path = home.filter(|value| !value.is_empty()).map(PathBuf::from);
-    let raw = match config_dir {
-        Some(dir) => PathBuf::from(dir),
-        None => home_path.as_ref()?.join(".claude"),
-    };
-    let normalized = normalize_profile_root(&raw, home_path.as_deref(), current_dir);
-    Some(hash_profile_root(&normalized))
-}
-
-fn normalize_profile_root(path: &Path, home: Option<&Path>, current_dir: Option<&Path>) -> PathBuf {
-    let expanded = expand_tilde(path, home);
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else if let Some(cwd) = current_dir {
-        cwd.join(expanded)
-    } else {
-        expanded
-    };
-    normalize_components(&absolute)
-}
-
-fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
-    let mut components = path.components();
-    match (components.next(), home) {
-        (Some(Component::Normal(first)), Some(home)) if first == "~" => {
-            let rest = components.as_path();
-            if rest.as_os_str().is_empty() {
-                home.to_path_buf()
-            } else {
-                home.join(rest)
-            }
-        }
-        _ => path.to_path_buf(),
-    }
-}
-
-fn normalize_components(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(name) => out.push(name),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        out
-    }
-}
-
-fn hash_profile_root(path: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"claude-quota-scope\0");
-    hasher.update(path.as_os_str().as_encoded_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 pub fn parse_statusline(
     value: &Value,
@@ -108,6 +29,7 @@ pub fn parse_statusline(
     let Some(limits) = value.get("rate_limits") else {
         return Ok(
             ProviderSnapshot::new(Provider::Claude, vec![], fetched_at_unix)
+                .session_local()
                 .with_model(model)
                 .with_context(context),
         );
@@ -122,12 +44,14 @@ pub fn parse_statusline(
     if windows.is_empty() {
         return Ok(
             ProviderSnapshot::new(Provider::Claude, vec![], fetched_at_unix)
+                .session_local()
                 .with_model(model)
                 .with_context(context),
         );
     }
     Ok(
         ProviderSnapshot::new(Provider::Claude, windows, fetched_at_unix)
+            .session_local()
             .with_model(model)
             .with_context(context),
     )
@@ -339,8 +263,6 @@ pub(crate) fn transcript_for_session(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::ffi::OsStr;
-    use std::path::Path;
 
     #[test]
     fn parses_claude_five_hour_and_weekly_limits() {
@@ -631,62 +553,5 @@ mod tests {
         assert!(!is_anthropic_model_id("glm-5.3"));
         assert!(!is_anthropic_model_id("kimi-k3"));
         assert!(!is_anthropic_model_id(""));
-    }
-
-    #[test]
-    fn quota_scope_is_stable_for_the_same_profile_root() {
-        let home = OsStr::new("/Users/me");
-        let unset = quota_scope_id(None, Some(home), None).unwrap();
-        let explicit =
-            quota_scope_id(Some(OsStr::new("/Users/me/.claude")), Some(home), None).unwrap();
-        let trailing =
-            quota_scope_id(Some(OsStr::new("/Users/me/.claude/")), Some(home), None).unwrap();
-        assert_eq!(unset, explicit);
-        assert_eq!(unset, trailing);
-        assert_eq!(unset.len(), 64);
-        assert!(unset.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn quota_scope_differs_across_config_dirs() {
-        let work = quota_scope_id(Some(OsStr::new("/tmp/.claude-work")), None, None).unwrap();
-        let personal =
-            quota_scope_id(Some(OsStr::new("/tmp/.claude-personal")), None, None).unwrap();
-        assert_ne!(work, personal);
-    }
-
-    #[test]
-    fn quota_scope_normalizes_tilde_and_relative_paths() {
-        let home = Path::new("/Users/me");
-        let cwd = Path::new("/Users/me/proj");
-        let tilde = quota_scope_id(
-            Some(OsStr::new("~/.claude-work")),
-            Some(home.as_os_str()),
-            Some(cwd),
-        )
-        .unwrap();
-        let absolute = quota_scope_id(
-            Some(OsStr::new("/Users/me/.claude-work")),
-            Some(home.as_os_str()),
-            Some(cwd),
-        )
-        .unwrap();
-        let relative = quota_scope_id(
-            Some(OsStr::new("../.claude-work")),
-            Some(home.as_os_str()),
-            Some(cwd),
-        )
-        .unwrap();
-        assert_eq!(tilde, absolute);
-        assert_eq!(relative, absolute);
-    }
-
-    #[test]
-    fn quota_scope_never_embeds_the_config_path() {
-        let path = "/Users/secret/.claude-work";
-        let scope = quota_scope_id(Some(OsStr::new(path)), None, None).unwrap();
-        assert!(!scope.contains("secret"));
-        assert!(!scope.contains("claude"));
-        assert!(!scope.contains('/'));
     }
 }

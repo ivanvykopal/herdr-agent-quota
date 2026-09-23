@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Build, link, enable, and configure herdr-agent-quota in one step.
+# Build, link, enable, and configure herdr-agent-usage in one step.
 #
 # Usage:
 #   ./install.sh
 #   ./install.sh --agent claude,codex
 #   ./install.sh --watch-interval-seconds 300
-#   ./install.sh --sidebar-layout stacked
+#   ./install.sh --sidebar-layout packed
 #   ./install.sh --row-gap 0
 #   ./install.sh --quota-percent used
 #   ./install.sh --fields topic,model,context,5h,7d
-#   ./install.sh --brand-colors off
-#   ./install.sh --agent-order quota
+#   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
 #
 # --agent installs only the agents you name (all, claude, codex, grok, agy,
-# opencode, pi, omp, devin). Anything you leave out gets no sidebar row, no
+# opencode, pi, omp, devin, muse, cursor). Anything you leave out gets no sidebar row, no
 # statusLine entry and no hook file. The default is every supported agent.
 #
-# --sidebar-layout packed (default) joins cache/TTL and 5h/7d on one row.
-# stacked puts provider, model, cache, TTL, context, 5h, and 7d on their own rows.
+# --sidebar-layout gauges (default) draws a meter beside each quota number.
+# packed joins cache/TTL and 5h/7d on one row. stacked puts provider, model,
+# cache, TTL, context, 5h, and 7d on their own rows without meters.
 #
 # --row-gap 1 (default) leaves one blank row between agent panes; 0 packs them
 # flush. Herdr only accepts whole rows.
@@ -26,16 +26,18 @@
 # --quota-percent remaining (default) shows how much quota is left; used shows
 # how much has been consumed. The colour always follows what is left.
 #
-# --fields picks the quota fields the sidebar shows: all (default), none, or a
-# comma-separated list of topic, model, cache, ttl, context, 5h, 7d. The
-# provider and the error token are always shown.
+# --fields picks the quota fields the sidebar shows: all, none, or a
+# comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d,
+# 30d. Default is provider, topic, model, context, 5h, 7d, 30d (cache and TTL
+# off). The error token is always shown.
 #
-# --brand-colors on (default) tints provider and model with each agent's hue;
-# off leaves them in the sidebar's own text colour. Severity colours stay.
+# --brand-colors is accepted for compatibility with older installs but has no
+# effect; identity text follows the sidebar theme and icons show status colour.
 #
-# --agent-order default (default) leaves Herdr's own agent panel ordering
-# alone. quota asks Herdr to put the agent with the least quota left at the
-# top; it replaces the panel's sort until it is set back to default.
+# --agent-order quota (default) keeps each Space contiguous and ranks by
+# least quota left inside the space; it replaces the panel's sort until it
+# is set back to default. default leaves Herdr's own agent panel ordering
+# alone (also Space-grouped unless the user set priority).
 #
 # --low-quota-alert off (default) never notifies. A percentage notifies once,
 # per provider, when its remaining quota falls to that number or below, and
@@ -61,7 +63,6 @@ SIDEBAR_LAYOUT=""
 ROW_GAP=""
 QUOTA_PERCENT=""
 FIELDS=""
-BRAND_COLORS=""
 AGENT_ORDER=""
 LOW_QUOTA_ALERT=""
 
@@ -99,7 +100,10 @@ while (($# > 0)); do
       ;;
     --brand-colors)
       (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
-      BRAND_COLORS="$2"
+      case "$2" in
+        on|off) ;;
+        *) die "brand-colors must be on or off" ;;
+      esac
       shift 2
       ;;
     --agent-order)
@@ -132,8 +136,8 @@ command -v herdr >/dev/null 2>&1 || die "Herdr is not installed or not on PATH"
 command -v cargo >/dev/null 2>&1 || die "Rust/Cargo is not installed or not on PATH"
 
 case "$SIDEBAR_LAYOUT" in
-  ""|packed|stacked) ;;
-  *) die "sidebar-layout must be packed or stacked" ;;
+  ""|packed|stacked|gauges) ;;
+  *) die "sidebar-layout must be packed, stacked, or gauges" ;;
 esac
 case "$ROW_GAP" in
   ""|0|1) ;;
@@ -142,10 +146,6 @@ esac
 case "$QUOTA_PERCENT" in
   ""|remaining|used) ;;
   *) die "quota-percent must be remaining or used" ;;
-esac
-case "$BRAND_COLORS" in
-  ""|on|off) ;;
-  *) die "brand-colors must be on or off" ;;
 esac
 case "$AGENT_ORDER" in
   ""|default|quota) ;;
@@ -160,11 +160,14 @@ case "$LOW_QUOTA_ALERT" in
 esac
 # The field list is validated by configure, which owns the field names.
 
-printf '%s\n' '→ building herdr-agent-quota'
+printf '%s\n' '→ building herdr-agent-usage'
 cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
 
 printf '%s\n' '→ linking and enabling the Herdr plugin'
+collect_alias_plugin_dirs
 herdr plugin link "$ROOT" --enabled
+adopt_alias_plugin_dirs || die "cannot resolve plugin config directory"
+unlink_alias_plugins
 
 # Herdr runs a plugin action with a fixed command line, in the server's own
 # environment: variables exported around `herdr plugin action invoke` never
@@ -174,23 +177,22 @@ write_plugin_pref() {
   local name="$1" value="$2"
   [[ -z "$value" ]] && return 0
   local directory
-  directory="$(herdr plugin config-dir herdr-agent-quota)" \
+  directory="$(herdr plugin config-dir "$PLUGIN_ID")" \
     || die "cannot resolve plugin config directory"
   mkdir -p "$directory"
   printf '%s\n' "$value" > "$directory/$name"
 }
 
-write_plugin_pref agents "$AGENTS"
+write_plugin_pref agents "$(agents_pref_value "$AGENTS")"
 write_plugin_pref watch-interval-seconds "$WATCH_INTERVAL_SECONDS"
 write_plugin_pref sidebar-layout "$SIDEBAR_LAYOUT"
 write_plugin_pref row-gap "$ROW_GAP"
 write_plugin_pref quota-percent "$QUOTA_PERCENT"
 write_plugin_pref fields "$FIELDS"
-write_plugin_pref brand-colors "$BRAND_COLORS"
 write_plugin_pref agent-order "$AGENT_ORDER"
 write_plugin_pref low-quota-alert "$LOW_QUOTA_ALERT"
 
 printf '%s\n' '→ installing reversible sidebar and provider collectors'
 invoke_action_and_wait configure || die "configuration action failed"
 
-printf '%s\n' 'Installed. Restart already-running agent sessions once so they load the refreshed hooks.'
+printf '%s\n' 'Installed / updated. Existing preferences are retained and quota refresh is restored. Restart sessions only to load newly added hooks or integrations.'

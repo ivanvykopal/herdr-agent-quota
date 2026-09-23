@@ -5,22 +5,17 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Read the provider's human-readable active model label from a statusLine
-/// payload. The display name is intentionally preferred over the model id so
-/// the sidebar stays useful at a glance and does not expose provider-specific
-/// implementation identifiers.
+/// Read the active model label from a statusLine payload. The display name
+/// is preferred so the sidebar stays readable at a glance; a payload that
+/// reports only an id (a model released after this build, or a new alias)
+/// shows that id rather than an empty identity row.
 pub fn parse_model(value: &Value) -> Option<String> {
-    value
-        .get("model")
-        .and_then(Value::as_object)
-        .and_then(|model| {
-            model
-                .get("display_name")
-                .or_else(|| model.get("displayName"))
-                .and_then(Value::as_str)
-        })
+    let model = value.get("model")?.as_object()?;
+    ["display_name", "displayName", "id"]
+        .into_iter()
+        .filter_map(|key| model.get(key).and_then(Value::as_str))
         .map(str::trim)
-        .filter(|model| !model.is_empty())
+        .find(|model| !model.is_empty())
         .map(str::to_string)
 }
 
@@ -239,17 +234,42 @@ mod tests {
     }
 
     #[test]
-    fn model_parser_requires_a_human_readable_display_name() {
-        assert_eq!(
-            parse_model(&json!({"model": {"id": "claude-sonnet-4"}})),
-            None
-        );
+    fn model_parser_prefers_the_display_name_and_never_drops_a_reported_id() {
         assert_eq!(
             parse_model(&json!({
-                "model": {"displayName": "Sonnet"}
+                "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"}
             })),
+            Some("Opus 5.5".to_string())
+        );
+        assert_eq!(
+            parse_model(&json!({"model": {"displayName": "Sonnet"}})),
             Some("Sonnet".to_string())
         );
+        for id in ["claude-opus-5-5", "zz-unreleased-model-9"] {
+            assert_eq!(
+                parse_model(&json!({"model": {"id": id, "display_name": " "}})),
+                Some(id.to_string())
+            );
+        }
+        assert_eq!(parse_model(&json!({"model": {"id": ""}})), None);
+    }
+
+    #[test]
+    fn zero_cache_reads_remain_a_real_zero_percent_hit() {
+        let value = json!({
+            "used_percentage": 3.4,
+            "current_usage": {
+                "input_tokens": 25943,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        });
+        let context = parse_context(Some(&value)).unwrap().unwrap();
+        let cache = context.cache.unwrap();
+        assert_eq!(cache.fresh_input_tokens, 25943);
+        assert_eq!(cache.read_tokens, 0);
+        assert_eq!(cache.creation_tokens, 0);
+        assert_eq!(cache.hit_percent, 0.0);
     }
 
     #[test]

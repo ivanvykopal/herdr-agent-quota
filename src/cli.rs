@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "herdr-agent-quota",
+    name = "herdr-agent-usage",
     version,
     about = "Show AI agent subscription quota in Herdr"
 )]
@@ -28,6 +28,17 @@ pub enum Command {
         /// Print the per-provider outcome as JSON.
         #[arg(long)]
         json: bool,
+        /// Approve macOS Keychain access for Muse or Cursor interactively
+        /// (one-time).
+        ///
+        /// Without a recorded approval, background reads skip the keychain
+        /// silently instead of prompting. Run once in a terminal and click
+        /// Always Allow (not Allow) on the macOS prompt; afterwards all
+        /// refreshes work unattended. Cursor Agent CLI stores its login in
+        /// Keychain on macOS (`cursor-agent login`); Muse does the same for
+        /// `storage: "keychain"` logins.
+        #[arg(long)]
+        keychain_approve: bool,
     },
     /// Keep selected working providers' quotas fresh with one global poller.
     /// This is started automatically by the Herdr status event hook.
@@ -38,6 +49,9 @@ pub enum Command {
         /// Override the configured poll interval for this run.
         #[arg(long)]
         interval_seconds: Option<u64>,
+        /// Internal: the event already refreshed its named pane.
+        #[arg(long, hide = true)]
+        defer: bool,
     },
     /// Herdr startup hook: restore plugin-owned Herdr state, then refresh.
     ///
@@ -74,7 +88,7 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["check", "apply"])]
         uninstall: bool,
         /// Agents to configure: all, claude, codex, grok, agy, opencode, pi,
-        /// omp, devin. Repeat or comma-separate to pick several. Defaults to
+        /// omp, devin, muse, cursor. Repeat or comma-separate to pick several. Defaults to
         /// every supported agent (or $HERDR_AGENT_QUOTA_AGENTS when set), so
         /// `--uninstall` alone still removes everything this plugin installed.
         #[arg(long, value_delimiter = ',')]
@@ -82,11 +96,11 @@ pub enum Command {
         /// Persist the active-turn poll interval while applying configuration.
         #[arg(long, requires = "apply")]
         watch_interval_seconds: Option<u64>,
-        /// Sidebar row layout: packed joins related tokens on one row;
-        /// stacked puts provider, model, cache, TTL, context, 5h, and 7d on
-        /// their own rows.
-        /// Herdr plugin actions run a fixed command line, so install.sh
-        /// passes this through $HERDR_AGENT_QUOTA_SIDEBAR_LAYOUT.
+        /// Sidebar row layout: gauges (default) adds a meter beside each
+        /// quota number; packed joins related tokens on one row; stacked
+        /// puts provider, model, cache, TTL, context, 5h, and 7d on their
+        /// own rows. Herdr plugin actions run a fixed command line, so
+        /// install.sh passes this through $HERDR_AGENT_QUOTA_SIDEBAR_LAYOUT.
         #[arg(long, value_enum)]
         sidebar_layout: Option<SidebarLayout>,
         /// Whether quota percentages read as remaining (default) or used.
@@ -95,12 +109,12 @@ pub enum Command {
         #[arg(long, value_enum)]
         quota_percent: Option<PercentStyle>,
         /// Quota fields the sidebar shows: all (default), none, or a
-        /// comma-separated list of topic, model, cache, ttl, context, 5h, 7d.
-        /// Provider and the error token are always shown.
+        /// comma-separated list of provider, topic, model, cache, ttl,
+        /// context, 5h, 7d. The error token is always shown.
         #[arg(long, value_parser = parse_field_set)]
         fields: Option<FieldSet>,
-        /// Whether provider and model carry each agent's brand hue. Severity
-        /// colours are unaffected.
+        /// Deprecated compatibility setting. Identity text now follows the
+        /// sidebar theme; status colour lives on the brand icon.
         #[arg(long, value_enum)]
         brand_colors: Option<BrandColors>,
         /// Blank rows between agent panes. `1` (default) separates them;
@@ -139,6 +153,9 @@ pub enum Command {
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
     },
+    /// Cursor CLI afterAgentResponse/stop/preCompact hook. Cursor invokes this;
+    /// not for manual use.
+    CursorHooks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -149,6 +166,8 @@ pub enum ProviderSelection {
     Claude,
     Agy,
     Devin,
+    Muse,
+    Cursor,
 }
 
 impl ProviderSelection {
@@ -160,6 +179,8 @@ impl ProviderSelection {
             Self::Claude => vec![Provider::Claude],
             Self::Agy => vec![Provider::Agy],
             Self::Devin => vec![Provider::Devin],
+            Self::Muse => vec![Provider::Muse],
+            Self::Cursor => vec![Provider::Cursor],
         }
     }
 }
@@ -179,17 +200,23 @@ pub enum AgentSelection {
     Pi,
     Omp,
     Devin,
+    Muse,
+    Cursor,
 }
 
 /// How quota tokens are arranged in Herdr's agent sidebar.
 ///
-/// Packed is the historical layout: cache sits beside TTL, and 5h sits beside
-/// 7d. Stacked gives each field its own row so a narrow sidebar does not
-/// truncate both values. Empty tokens still collapse in both layouts.
+/// Gauges is the default: one field per row with a meter beside each quota
+/// number. Packed is the historical compact layout (cache beside TTL, 5h
+/// beside 7d). Stacked is the same rows as gauges without the meters, so a
+/// sidebar too narrow for a bar still has a readable layout. Empty tokens
+/// collapse in every layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SidebarLayout {
-    /// Join related tokens on one row (`cache · ttl`, `5h · 7d`).
+    /// One field per row, with a meter beside each quota percentage.
     #[default]
+    Gauges,
+    /// Join related tokens on one row (`cache · ttl`, `5h · 7d`).
     Packed,
     /// One field per row (provider, model, cache, TTL, context, 5h, 7d).
     Stacked,
@@ -197,12 +224,14 @@ pub enum SidebarLayout {
 
 /// A quota field the sidebar can be told to leave out.
 ///
-/// Provider is not here: it is the identity of the row, and a row that cannot
-/// say which subscription it belongs to is worse than no row. `$quota_error`
-/// is not here either — it is how the plugin reports that it could not speak
-/// for a pane at all, and hiding it would hide the failure, not the field.
+/// Provider is the identity of the row, so leaving it out costs the row its
+/// name; it is a real choice (a sidebar of numbers alone is a choice someone
+/// can make) and not a safe default, which is why it starts on. `$quota_error`
+/// is not here: it is how the plugin reports that it could not speak for a pane
+/// at all, and hiding it would hide the failure, not the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarField {
+    Provider,
     Topic,
     Model,
     Cache,
@@ -210,10 +239,12 @@ pub enum SidebarField {
     Context,
     FiveHour,
     Week,
+    Month,
 }
 
 impl SidebarField {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
+        Self::Provider,
         Self::Topic,
         Self::Model,
         Self::Cache,
@@ -221,10 +252,12 @@ impl SidebarField {
         Self::Context,
         Self::FiveHour,
         Self::Week,
+        Self::Month,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Provider => "provider",
             Self::Topic => "topic",
             Self::Model => "model",
             Self::Cache => "cache",
@@ -232,6 +265,7 @@ impl SidebarField {
             Self::Context => "context",
             Self::FiveHour => "5h",
             Self::Week => "7d",
+            Self::Month => "30d",
         }
     }
 
@@ -243,11 +277,12 @@ impl SidebarField {
             .or(match name.as_str() {
                 "week" => Some(Self::Week),
                 "5h_limit" | "five_hour" => Some(Self::FiveHour),
+                "month" | "monthly" => Some(Self::Month),
                 _ => None,
             })
     }
 
-    fn bit(self) -> u8 {
+    fn bit(self) -> u16 {
         1 << Self::ALL
             .iter()
             .position(|field| *field == self)
@@ -255,12 +290,27 @@ impl SidebarField {
     }
 }
 
-/// Which quota fields the sidebar shows. Every field is on by default.
+/// Which quota fields the sidebar shows.
+///
+/// Default is provider, topic, model, context, 5h, 7d, and 30d. Cache and TTL
+/// stay off until the user turns them on — most installs care about quota and
+/// context first, and those two rows add noise on a gauges layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldSet(u8);
+pub struct FieldSet(u16);
 
 impl FieldSet {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_FIELDS";
+
+    /// The token `as_list` puts in front of a selection that leaves the
+    /// provider out while keeping every other field.
+    ///
+    /// That selection is otherwise written as the list a pre-`provider` build
+    /// stored for "everything on", which `parse` has to go on reading as
+    /// `all()`. The marker keeps the two apart without a version stamp.
+    const NO_PROVIDER: &'static str = "no-provider";
+    /// Marker for "everything except 30d". That selection is otherwise the
+    /// list a pre-`30d` build stored for "everything on".
+    const NO_MONTH: &'static str = "no-30d";
 
     pub fn all() -> Self {
         Self(
@@ -268,6 +318,30 @@ impl FieldSet {
                 .iter()
                 .fold(0, |bits, field| bits | field.bit()),
         )
+    }
+
+    /// The field list a build without a provider field wrote for "everything
+    /// on". Those builds drew the provider name regardless of the list, so the
+    /// list only ever named the other seven fields.
+    fn legacy_pre_provider_full() -> Self {
+        Self(
+            [
+                SidebarField::Topic,
+                SidebarField::Model,
+                SidebarField::Cache,
+                SidebarField::Ttl,
+                SidebarField::Context,
+                SidebarField::FiveHour,
+                SidebarField::Week,
+            ]
+            .into_iter()
+            .fold(0, |bits, field| bits | field.bit()),
+        )
+    }
+
+    /// The field list a build without a 30d field wrote for "everything on".
+    fn legacy_full() -> Self {
+        Self(Self::legacy_pre_provider_full().0 | SidebarField::Provider.bit())
     }
 
     pub fn contains(self, field: SidebarField) -> bool {
@@ -285,22 +359,54 @@ impl FieldSet {
     /// A comma-separated list of the fields that are on, in `ALL` order.
     ///
     /// The empty selection is written as `none` rather than an empty string,
-    /// which every preference reader treats as "not set".
+    /// which every preference reader treats as "not set". A selection that
+    /// hides the provider and keeps the rest is written with `no-provider` in
+    /// front, because its bare list is the one `parse` reads as `all()`.
     pub fn as_list(self) -> String {
         if self.is_empty() {
             return "none".to_string();
         }
-        SidebarField::ALL
+        let names = SidebarField::ALL
             .into_iter()
             .filter(|field| self.contains(*field))
             .map(SidebarField::name)
             .collect::<Vec<_>>()
-            .join(",")
+            .join(",");
+        let mut markers = Vec::new();
+        if !self.contains(SidebarField::Provider)
+            && (self == Self::all().toggled(SidebarField::Provider)
+                || self
+                    == Self::all()
+                        .toggled(SidebarField::Provider)
+                        .toggled(SidebarField::Month))
+        {
+            markers.push(Self::NO_PROVIDER);
+        }
+        if !self.contains(SidebarField::Month)
+            && (self == Self::all().toggled(SidebarField::Month)
+                || self
+                    == Self::all()
+                        .toggled(SidebarField::Provider)
+                        .toggled(SidebarField::Month))
+        {
+            markers.push(Self::NO_MONTH);
+        }
+        if markers.is_empty() {
+            names
+        } else {
+            format!("{},{names}", markers.join(","))
+        }
     }
 
     /// `None` when nothing in the list is a field name, so an unparsable
     /// preference falls through to the next source rather than hiding
     /// everything.
+    ///
+    /// Lists that never name the provider predate the provider field, which a
+    /// full selection meant all of, so the pre-`provider` full list is read as
+    /// `all()`. Narrower lists mean exactly what they say: `fields=5h` is how
+    /// the provider stays hidden. `no-provider` is `as_list`'s marker for the
+    /// one selection that would otherwise be mistaken for the legacy list.
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
         if raw.eq_ignore_ascii_case("all") {
@@ -309,11 +415,32 @@ impl FieldSet {
         if raw.eq_ignore_ascii_case("none") {
             return Some(Self(0));
         }
-        let bits = raw
-            .split(',')
-            .filter_map(SidebarField::parse)
-            .fold(0, |bits, field| bits | field.bit());
-        (bits != 0).then_some(Self(bits))
+        let mut bits = 0u16;
+        let mut provider_named = false;
+        let mut month_excluded = false;
+        for token in raw.split(',').map(str::trim) {
+            if token.eq_ignore_ascii_case(Self::NO_PROVIDER) {
+                provider_named = true;
+                continue;
+            }
+            if token.eq_ignore_ascii_case(Self::NO_MONTH) {
+                month_excluded = true;
+                continue;
+            }
+            let Some(field) = SidebarField::parse(token) else {
+                continue;
+            };
+            provider_named |= field == SidebarField::Provider;
+            bits |= field.bit();
+        }
+        let fields = Self(bits);
+        if !provider_named && fields == Self::legacy_pre_provider_full() {
+            return Some(Self::all());
+        }
+        if !month_excluded && fields == Self::legacy_full() {
+            return Some(Self::all());
+        }
+        (bits != 0).then_some(fields)
     }
 
     pub fn from_arg_or_env(value: Option<Self>) -> Option<Self> {
@@ -330,6 +457,8 @@ impl FieldSet {
 impl Default for FieldSet {
     fn default() -> Self {
         Self::all()
+            .toggled(SidebarField::Cache)
+            .toggled(SidebarField::Ttl)
     }
 }
 
@@ -346,11 +475,8 @@ fn parse_field_set(value: &str) -> Result<FieldSet, String> {
     })
 }
 
-/// Whether provider and model carry each agent's brand hue.
-///
-/// Herdr owns the sidebar theme; this is the only colour the plugin writes of
-/// its own, so it is the only colour it can offer to turn off. Severity
-/// colours stay in both settings: they are information, not decoration.
+/// Legacy preference retained so older managed rows can be recognised and
+/// removed during an upgrade or uninstall. It no longer changes new rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum BrandColors {
     #[default]
@@ -360,17 +486,6 @@ pub enum BrandColors {
 
 impl BrandColors {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_BRAND_COLORS";
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-
-    pub fn is_on(self) -> bool {
-        self == Self::On
-    }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
@@ -525,24 +640,30 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 
 /// How Herdr's Agent panel is ordered.
 ///
-/// `quota` hands Herdr a declarative Agent view sorted by this plugin's
-/// `quota_headroom` token, so the agent closest to its limit sits at the top.
-/// Herdr keeps exactly one such view, and an active one replaces the user's
-/// own `ui.agent_panel_sort` policy until it is cleared. That is why the
-/// default is `default`: the panel belongs to the user, not to this plugin.
+/// `quota` hands Herdr a declarative Agent view that keeps workspaces
+/// contiguous (`workspace_order`) and ranks by this plugin's
+/// `quota_headroom` token inside each space, so the agent closest to its
+/// limit sits at the top of its group. Herdr keeps exactly one such view,
+/// and an active one replaces the user's own `ui.agent_panel_sort` policy
+/// until it is cleared.
+///
+/// Default is `quota`: Space grouping is what most installs want with the
+/// `$quota_group` headers, and ranking by headroom is a free extra on top.
+/// Choose `default` to hand the panel back to Herdr's own policy (also
+/// Space-grouped unless the user set `priority`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum AgentOrder {
     /// Leave Herdr's own ordering alone.
-    #[default]
     Default,
-    /// Least quota left first.
+    /// By space, then least quota left first.
+    #[default]
     Quota,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
     /// Herdr's label for the view, shown where it names the active sort.
-    pub const LABEL: &'static str = "Quota headroom";
+    pub const LABEL: &'static str = "Quota by space";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -558,7 +679,7 @@ impl AgentOrder {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
-            "quota" | "headroom" | "on" => Some(Self::Quota),
+            "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
             _ => None,
         }
     }
@@ -646,11 +767,14 @@ fn parse_low_quota_alert(value: &str) -> Result<LowQuotaAlert, String> {
 
 impl SidebarLayout {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_SIDEBAR_LAYOUT";
+    /// The layouts the settings pane cycles through, the default first.
+    pub const CHOICES: [Self; 3] = [Self::Gauges, Self::Packed, Self::Stacked];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Packed => "packed",
             Self::Stacked => "stacked",
+            Self::Gauges => "gauges",
         }
     }
 
@@ -658,11 +782,12 @@ impl SidebarLayout {
         match name.trim().to_ascii_lowercase().as_str() {
             "packed" => Some(Self::Packed),
             "stacked" => Some(Self::Stacked),
+            "gauges" => Some(Self::Gauges),
             _ => None,
         }
     }
 
-    /// Flag wins; otherwise the installer environment; otherwise packed.
+    /// Flag wins; otherwise the installer environment; otherwise gauges.
     ///
     /// Persistence is applied by `configure` after this, so a later repair
     /// with no flag still keeps the layout the user installed.
@@ -679,7 +804,11 @@ impl SidebarLayout {
 
 impl AgentSelection {
     /// Every agent `configure` supports, in the order they are reported.
-    pub const SUPPORTED: [Harness; 8] = [
+    ///
+    /// New agents are appended, never inserted, so a saved complete list from
+    /// an earlier build is a proper prefix of this array and can still mean
+    /// "everything on" after a provider is added.
+    pub const SUPPORTED: [Harness; 10] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Grok,
@@ -688,7 +817,20 @@ impl AgentSelection {
         Harness::Pi,
         Harness::Omp,
         Harness::Devin,
+        Harness::Muse,
+        Harness::Cursor,
     ];
+
+    /// Length of the first complete list the settings pane persisted.
+    ///
+    /// Shorter enumerations were always subsets. Prefixes of this length or
+    /// more were "everything on" at write time.
+    pub(crate) const FIRST_PERSISTED_FULL: usize = 6;
+
+    /// Token `as_stored_list` puts in front of a subset so it is not mistaken
+    /// for a legacy complete list. `--agent` never carries it: clap has no
+    /// such value, and an explicit flag is already exact.
+    const EXPLICIT: &'static str = "only";
 
     fn harness(self) -> Option<Harness> {
         match self {
@@ -701,6 +843,23 @@ impl AgentSelection {
             Self::Pi => Some(Harness::Pi),
             Self::Omp => Some(Harness::Omp),
             Self::Devin => Some(Harness::Devin),
+            Self::Muse => Some(Harness::Muse),
+            Self::Cursor => Some(Harness::Cursor),
+        }
+    }
+
+    pub fn harness_name(harness: Harness) -> &'static str {
+        match harness {
+            Harness::Claude => "claude",
+            Harness::Codex => "codex",
+            Harness::Grok => "grok",
+            Harness::Agy => "agy",
+            Harness::OpenCode => "opencode",
+            Harness::Pi => "pi",
+            Harness::Omp => "omp",
+            Harness::Devin => "devin",
+            Harness::Muse => "muse",
+            Harness::Cursor => "cursor",
         }
     }
 
@@ -709,8 +868,9 @@ impl AgentSelection {
     /// A Herdr plugin action runs a fixed command line in the *server's*
     /// environment, so a variable exported around `herdr plugin action invoke`
     /// never reaches it. The plugin config directory is the channel that does
-    /// work, and it is what `install.sh` writes; the environment is still
-    /// honoured first for a direct CLI run.
+    /// work, and it is what `install.sh` writes. A direct-CLI environment
+    /// override is still honoured first, but it is explicit and therefore
+    /// parsed exactly; only persisted preferences get the legacy-full upgrade.
     ///
     /// Anything unparsable falls through to the next source and finally to
     /// every supported agent, so `--uninstall` alone still removes everything.
@@ -718,23 +878,49 @@ impl AgentSelection {
         if !values.is_empty() {
             return Self::resolve(values);
         }
-        [
-            std::env::var("HERDR_AGENT_QUOTA_AGENTS").ok(),
-            crate::prefs::read(crate::prefs::AGENTS),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|raw| Self::parse_list(&raw))
-        .unwrap_or_else(|| Self::SUPPORTED.to_vec())
+        if let Ok(raw) = std::env::var("HERDR_AGENT_QUOTA_AGENTS") {
+            if let Some(agents) = Self::parse_list(&raw, false) {
+                return agents;
+            }
+        }
+        crate::prefs::read(crate::prefs::AGENTS)
+            .and_then(|raw| Self::parse_list(&raw, true))
+            .unwrap_or_else(|| Self::SUPPORTED.to_vec())
     }
 
     /// A comma-separated selection, or `None` when it names nothing valid.
-    fn parse_list(raw: &str) -> Option<Vec<Harness>> {
-        let parsed: Vec<Self> = raw
+    ///
+    /// When `upgrade_legacy_full` is true, an unmarked list that is a proper
+    /// prefix of `SUPPORTED` of length [`Self::FIRST_PERSISTED_FULL`] or more
+    /// was complete when written, so it is read as every agent. That upgrade
+    /// is for persisted preferences only; direct environment overrides are
+    /// explicit selections and stay exact. `only` keeps a newly-stored subset
+    /// from colliding with the legacy persisted form.
+    fn parse_list(raw: &str, upgrade_legacy_full: bool) -> Option<Vec<Harness>> {
+        let mut explicit = false;
+        let mut parsed = Vec::new();
+        for name in raw
             .split(',')
-            .filter_map(|name| Self::parse(name.trim()))
-            .collect();
-        (!parsed.is_empty()).then(|| Self::resolve(&parsed))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if name.eq_ignore_ascii_case(Self::EXPLICIT) {
+                explicit = true;
+                continue;
+            }
+            if let Some(value) = Self::parse(name) {
+                parsed.push(value);
+            }
+        }
+        if parsed.is_empty() {
+            return None;
+        }
+        let resolved = Self::resolve(&parsed);
+        if upgrade_legacy_full && !explicit && Self::is_legacy_full(&resolved) {
+            Some(Self::SUPPORTED.to_vec())
+        } else {
+            Some(resolved)
+        }
     }
 
     fn parse(name: &str) -> Option<Self> {
@@ -748,8 +934,52 @@ impl AgentSelection {
             "pi" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
             "devin" => Some(Self::Devin),
+            "muse" => Some(Self::Muse),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
+    }
+
+    fn is_complete(agents: &[Harness]) -> bool {
+        agents == Self::SUPPORTED
+    }
+
+    fn is_legacy_full(agents: &[Harness]) -> bool {
+        let n = agents.len();
+        n >= Self::FIRST_PERSISTED_FULL
+            && n < Self::SUPPORTED.len()
+            && agents == &Self::SUPPORTED[..n]
+    }
+
+    /// Preference form: `all` when complete, `only,<names>` when a subset.
+    ///
+    /// `only` is what stops a subset that matches a legacy complete list —
+    /// turning Muse off today writes the pre-Muse full list — from being
+    /// read as every agent the next time a provider is added.
+    pub(crate) fn as_stored_list(agents: &[Harness]) -> String {
+        if Self::is_complete(agents) {
+            return "all".to_string();
+        }
+        format!("{},{}", Self::EXPLICIT, Self::names(agents))
+    }
+
+    /// `--agent` form: `all` when complete, otherwise the names. Never `only`;
+    /// clap has no such value, and a flag is already an exact selection.
+    pub(crate) fn as_cli_list(agents: &[Harness]) -> String {
+        if Self::is_complete(agents) {
+            "all".to_string()
+        } else {
+            Self::names(agents)
+        }
+    }
+
+    pub(crate) fn names(agents: &[Harness]) -> String {
+        agents
+            .iter()
+            .copied()
+            .map(Self::harness_name)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// Flatten a `--agent` selection into a deduplicated harness list that
@@ -776,7 +1006,7 @@ mod tests {
         }
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
         assert_eq!(AgentOrder::parse("sideways"), None);
-        assert_eq!(AgentOrder::default(), AgentOrder::Default);
+        assert_eq!(AgentOrder::default(), AgentOrder::Quota);
     }
 
     #[test]
@@ -828,6 +1058,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_explicit_list_matching_a_legacy_full_prefix_stays_exact() {
+        let raw = "claude,codex,grok,agy,opencode,pi";
+        assert_eq!(
+            AgentSelection::parse_list(raw, false),
+            Some(AgentSelection::SUPPORTED[..AgentSelection::FIRST_PERSISTED_FULL].to_vec())
+        );
+        assert_eq!(
+            AgentSelection::parse_list(raw, true),
+            Some(AgentSelection::SUPPORTED.to_vec())
+        );
+    }
+
     /// The environment cannot reach a Herdr plugin action, so the config-dir
     /// preference is the channel `install.sh` / `uninstall.sh` actually use.
     /// A selection that fails to arrive means `--uninstall --agent grok`
@@ -858,6 +1101,161 @@ mod tests {
         });
     }
 
+    /// A build before Muse wrote "everything on" as the eight names that then
+    /// existed. That list has to keep meaning every agent after Muse is added,
+    /// or `configure` judges it partial and a missing omp install becomes
+    /// fatal.
+    #[test]
+    fn a_saved_complete_list_from_before_a_new_agent_still_selects_everything() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::prefs::testing::with_config_dir(directory.path(), || {
+            crate::prefs::write(
+                crate::prefs::AGENTS,
+                "claude,codex,grok,agy,opencode,pi,omp,devin",
+            )
+            .unwrap();
+            assert_eq!(
+                AgentSelection::from_args_or_env(&[]),
+                AgentSelection::SUPPORTED.to_vec()
+            );
+
+            crate::prefs::write(
+                crate::prefs::AGENTS,
+                " claude, codex, grok, agy, opencode, pi, omp, devin ",
+            )
+            .unwrap();
+            assert_eq!(
+                AgentSelection::from_args_or_env(&[]),
+                AgentSelection::SUPPORTED.to_vec()
+            );
+
+            // The six- and seven-agent complete lists the settings pane wrote
+            // before Devin and omp are the same shape.
+            crate::prefs::write(
+                crate::prefs::AGENTS,
+                "claude,codex,grok,agy,opencode,pi,omp",
+            )
+            .unwrap();
+            assert_eq!(
+                AgentSelection::from_args_or_env(&[]),
+                AgentSelection::SUPPORTED.to_vec()
+            );
+            crate::prefs::write(crate::prefs::AGENTS, "claude,codex,grok,agy,opencode,pi").unwrap();
+            assert_eq!(
+                AgentSelection::from_args_or_env(&[]),
+                AgentSelection::SUPPORTED.to_vec()
+            );
+        });
+    }
+
+    /// Turning Muse off produces the pre-Muse full list. Without a marker that
+    /// selection would be upgraded back to everything on the next repair.
+    #[test]
+    fn an_explicit_subset_matching_a_legacy_full_list_is_not_upgraded() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::prefs::testing::with_config_dir(directory.path(), || {
+            crate::prefs::write(
+                crate::prefs::AGENTS,
+                "only,claude,codex,grok,agy,opencode,pi,omp,devin",
+            )
+            .unwrap();
+            let selected = AgentSelection::from_args_or_env(&[]);
+            assert_eq!(
+                selected,
+                vec![
+                    Harness::Claude,
+                    Harness::Codex,
+                    Harness::Grok,
+                    Harness::Agy,
+                    Harness::OpenCode,
+                    Harness::Pi,
+                    Harness::Omp,
+                    Harness::Devin,
+                ]
+            );
+            assert!(!selected.contains(&Harness::Muse));
+            assert!(!selected.contains(&Harness::Cursor));
+
+            crate::prefs::write(crate::prefs::AGENTS, "only,grok").unwrap();
+            assert_eq!(AgentSelection::from_args_or_env(&[]), vec![Harness::Grok]);
+        });
+    }
+
+    #[test]
+    fn a_complete_selection_is_stored_as_all_and_a_subset_as_only() {
+        assert_eq!(
+            AgentSelection::as_stored_list(&AgentSelection::SUPPORTED),
+            "all"
+        );
+        assert_eq!(
+            AgentSelection::as_cli_list(&AgentSelection::SUPPORTED),
+            "all"
+        );
+        assert_eq!(
+            AgentSelection::as_stored_list(&[Harness::Grok, Harness::Claude]),
+            "only,grok,claude"
+        );
+        assert_eq!(
+            AgentSelection::as_cli_list(&[Harness::Grok, Harness::Claude]),
+            "grok,claude"
+        );
+        let pre_muse = &[
+            Harness::Claude,
+            Harness::Codex,
+            Harness::Grok,
+            Harness::Agy,
+            Harness::OpenCode,
+            Harness::Pi,
+            Harness::Omp,
+            Harness::Devin,
+        ];
+        assert_eq!(
+            AgentSelection::as_stored_list(pre_muse),
+            "only,claude,codex,grok,agy,opencode,pi,omp,devin"
+        );
+        assert_eq!(
+            AgentSelection::as_cli_list(pre_muse),
+            "claude,codex,grok,agy,opencode,pi,omp,devin"
+        );
+        let pre_cursor = &AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1];
+        assert_eq!(
+            AgentSelection::as_stored_list(pre_cursor),
+            "only,claude,codex,grok,agy,opencode,pi,omp,devin,muse"
+        );
+        assert_eq!(
+            AgentSelection::as_cli_list(pre_cursor),
+            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
+        );
+    }
+
+    #[test]
+    fn every_supported_agent_round_trips_through_its_stored_name() {
+        for harness in AgentSelection::SUPPORTED {
+            let name = AgentSelection::harness_name(harness);
+            assert_eq!(
+                AgentSelection::parse(name).and_then(AgentSelection::harness),
+                Some(harness)
+            );
+        }
+    }
+
+    /// Inserting a harness in the middle would make a saved complete list
+    /// either fail to upgrade or upgrade the wrong subset.
+    #[test]
+    fn supported_agents_are_appended_so_legacy_full_lists_stay_prefixes() {
+        assert_eq!(
+            &AgentSelection::SUPPORTED[..AgentSelection::FIRST_PERSISTED_FULL],
+            &[
+                Harness::Claude,
+                Harness::Codex,
+                Harness::Grok,
+                Harness::Agy,
+                Harness::OpenCode,
+                Harness::Pi,
+            ]
+        );
+    }
+
     #[test]
     fn all_wins_and_is_the_default_so_uninstall_alone_removes_everything() {
         assert_eq!(
@@ -875,11 +1273,24 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_layout_parses_packed_and_stacked_and_ignores_junk() {
-        assert_eq!(SidebarLayout::parse("packed"), Some(SidebarLayout::Packed));
+    fn sidebar_layout_defaults_to_gauges() {
+        assert_eq!(SidebarLayout::default(), SidebarLayout::Gauges);
+        assert_eq!(SidebarLayout::CHOICES[0], SidebarLayout::Gauges);
+    }
+
+    #[test]
+    fn sidebar_layout_parses_every_choice_and_ignores_junk() {
+        for layout in SidebarLayout::CHOICES {
+            assert_eq!(SidebarLayout::parse(layout.as_str()), Some(layout));
+        }
         assert_eq!(
             SidebarLayout::parse("Stacked"),
             Some(SidebarLayout::Stacked)
+        );
+        assert_eq!(SidebarLayout::parse("Gauges"), Some(SidebarLayout::Gauges));
+        assert_eq!(
+            SidebarLayout::parse(" gauges "),
+            Some(SidebarLayout::Gauges)
         );
         assert_eq!(SidebarLayout::parse("nonsense"), None);
         assert_eq!(
@@ -912,5 +1323,72 @@ mod tests {
         assert_eq!(SidebarRowGap::parse("2"), None);
         assert_eq!(SidebarRowGap::parse("0.5"), None);
         assert_eq!(SidebarRowGap::default().as_u8(), 1);
+    }
+
+    /// Default omits cache and TTL: quota + context are the usual install, and
+    /// those two rows are optional in settings.
+    #[test]
+    fn the_default_field_set_omits_cache_and_ttl() {
+        let fields = FieldSet::default();
+        assert!(fields.contains(SidebarField::Provider));
+        assert!(fields.contains(SidebarField::Topic));
+        assert!(fields.contains(SidebarField::Model));
+        assert!(fields.contains(SidebarField::Context));
+        assert!(fields.contains(SidebarField::FiveHour));
+        assert!(fields.contains(SidebarField::Week));
+        assert!(fields.contains(SidebarField::Month));
+        assert!(!fields.contains(SidebarField::Cache));
+        assert!(!fields.contains(SidebarField::Ttl));
+        assert_eq!(
+            FieldSet::parse(&fields.as_list()),
+            Some(fields),
+            "default selection must round-trip without becoming all()"
+        );
+    }
+
+    /// A build without a provider field wrote "everything on" as the other
+    /// seven fields and drew the provider name anyway, so that exact list has
+    /// to keep meaning every field after an upgrade.
+    #[test]
+    fn the_pre_provider_full_list_still_selects_every_field() {
+        assert_eq!(
+            FieldSet::parse("topic,model,cache,ttl,context,5h,7d"),
+            Some(FieldSet::all())
+        );
+        assert_eq!(
+            FieldSet::parse(" topic , model, cache, ttl, context, 5h, 7d "),
+            Some(FieldSet::all())
+        );
+        // A narrower list is how the provider stays off, and a stale name in
+        // front of it must not change that.
+        assert_eq!(FieldSet::parse("junk,5h"), FieldSet::parse("5h"));
+    }
+
+    /// Hiding only the provider is one click in the settings pane, so its
+    /// stored form has to read back as itself rather than as the pre-provider
+    /// full list.
+    #[test]
+    fn hiding_only_the_provider_round_trips_through_its_stored_form() {
+        let providerless = FieldSet::all().toggled(SidebarField::Provider);
+        assert_eq!(FieldSet::parse(&providerless.as_list()), Some(providerless));
+
+        let five_hour = FieldSet::parse("5h").unwrap();
+        assert!(!five_hour.contains(SidebarField::Provider));
+        assert_eq!(FieldSet::parse(&five_hour.as_list()), Some(five_hour));
+        assert!(FieldSet::parse("none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_pre_month_full_list_still_selects_every_field() {
+        assert_eq!(
+            FieldSet::parse("provider,topic,model,cache,ttl,context,5h,7d"),
+            Some(FieldSet::all())
+        );
+        let without_month = FieldSet::all().toggled(SidebarField::Month);
+        assert_eq!(
+            FieldSet::parse(&without_month.as_list()),
+            Some(without_month)
+        );
+        assert!(without_month.as_list().starts_with("no-30d,"));
     }
 }

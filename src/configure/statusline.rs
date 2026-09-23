@@ -1,3 +1,4 @@
+use crate::identity::{self, PLUGIN_ID};
 use crate::process::{run_shell_with_deadline, CommandOutput, STATUSLINE_COMMAND_BUDGET};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -11,9 +12,24 @@ pub(crate) struct Adapter {
 }
 
 impl Adapter {
-    pub fn check(&self, path: &Path) -> Result<()> {
+    pub fn check(&self, path: &Path, state: &Path, executable: &Path) -> Result<()> {
         let settings = read_settings(path, self.label)?;
+        let command = settings
+            .get("statusLine")
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str);
         if self.is_installed(settings.get("statusLine")) {
+            // An upgrade that skipped `configure --apply` (the plugin id
+            // rename, a moved checkout) leaves the hook feeding another state
+            // directory, so this install never receives an observation.
+            if command != Some(self.wrapper_command(state, executable).as_str()) {
+                println!(
+                    "{} statusLine collector is stale and feeds another install: {}; `configure --apply` repairs it",
+                    self.label,
+                    path.display()
+                );
+                return Ok(());
+            }
             println!(
                 "{} statusLine collector is installed: {}",
                 self.label,
@@ -60,17 +76,7 @@ impl Adapter {
             fs::write(&backup, serde_json::to_vec_pretty(&original)?)
                 .with_context(|| format!("write {} statusLine backup", self.label))?;
         }
-        // The harness chooses the shell: Claude Code runs statusLine through
-        // Git Bash on Windows, other setups use `cmd.exe` or `sh`. An env
-        // assignment prefix is shell-specific (`set "X=.." &&` is a no-op in
-        // bash, which silently sent observations to a fallback directory), so
-        // the state directory travels as a quoted argument every shell reads.
-        let wrapper_command = format!(
-            "{} {} --state-dir {}",
-            shell_quote(executable),
-            self.subcommand,
-            shell_quote(state)
-        );
+        let wrapper_command = self.wrapper_command(state, executable);
         let status_line = settings
             .get_mut("statusLine")
             .and_then(Value::as_object_mut)
@@ -151,13 +157,27 @@ impl Adapter {
         run_shell_with_deadline(&command, input, STATUSLINE_COMMAND_BUDGET).map(Some)
     }
 
+    /// The harness chooses the shell: Claude Code runs statusLine through Git
+    /// Bash on Windows, other setups use `cmd.exe` or `sh`. An env-assignment
+    /// prefix is shell-specific (`set "X=.." &&` is a no-op in bash, which
+    /// silently sent observations to a fallback directory), so the state
+    /// directory travels as a quoted argument every shell reads.
+    fn wrapper_command(&self, state: &Path, executable: &Path) -> String {
+        format!(
+            "{} {} --state-dir {}",
+            shell_quote(executable),
+            self.subcommand,
+            shell_quote(state)
+        )
+    }
+
     fn is_installed(&self, status_line: Option<&Value>) -> bool {
         status_line
             .and_then(|value| value.get("command"))
             .and_then(Value::as_str)
             .is_some_and(|command| {
                 command.contains(self.subcommand)
-                    && (command.contains("herdr-agent-quota")
+                    && (identity::command_mentions_us(command)
                         || command.contains("agy-statusline.sh"))
             })
     }
@@ -263,7 +283,7 @@ fn write_settings(path: &Path, settings: &Value, label: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {label} settings directory"))?;
     }
-    let temporary = path.with_extension("json.herdr-agent-quota.tmp");
+    let temporary = path.with_extension(format!("json.{PLUGIN_ID}.tmp"));
     fs::write(&temporary, serde_json::to_vec_pretty(settings)?)?;
     fs::rename(temporary, path).with_context(|| format!("replace {label} settings"))
 }

@@ -1,5 +1,7 @@
 # Codex 与 Grok 的 context/cache 展示调研
 
+> Historical research, valid as of the date below. For current behavior and upgrade instructions, see the [README](../../README.md).
+
 研究日期：2026-08-26（Asia/Shanghai）  
 范围：本插件当前的 Codex/Grok 采集链路、OpenAI Codex 官方 app-server/TUI、Grok Build 官方 status line，以及成熟的 CodexBar 本地用量实现。  
 目标：解释截图中 Codex 只有 quota、没有 `context`/`cache` 的原因，并确定哪些字段可以安全接入 Herdr。

@@ -1,211 +1,277 @@
-# herdr-agent-quota
+# herdr-agent-usage
 
-Credential-scoped model, context, cache, and quota data in Herdr's Agent sidebar.
+Model, context, and subscription quota in Herdr's Agent sidebar — grouped by
+Space, with brand icons that carry agent status.
 
-[![CI](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![CI](https://github.com/levi-qiao/herdr-agent-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-usage/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-中文文档：[README.zh-CN.md](README.zh-CN.md)
+[简体中文](README.zh-CN.md)
 
-<table>
-<tr><th>packed (default)</th><th>stacked</th></tr>
-<tr>
-<td valign="top"><img src="docs/screenshots/sidebar-packed.png" alt="Packed sidebar" width="284"></td>
-<td valign="top"><img src="docs/screenshots/sidebar-stacked.png" alt="Stacked sidebar" width="177"></td>
-</tr>
-</table>
+<img src="docs/screenshots/sidebar-gauges.png" alt="Space-grouped gauges sidebar" width="320">
 
-Empty values collapse. Failed refreshes keep the last good value for the same
-account; confirmed PAYG sessions clear stale subscription quota.
+Agents are grouped under their Space. Each row leads with this plugin's brand
+icon — not Herdr's status ring. The icon colour tracks the agent: yellow while
+working, teal while done (until you focus it or move focus away from it), ink-white when idle.
+Provider and model stay ink-white; severity colours on the meters still mean
+remaining headroom.
 
-## Install
+The default layout is `gauges`: a meter beside each quota number. Bars fill to
+the printed number, and `cx`, `5h`, `7d`, and `30d` all follow `quota-percent`.
+Labels are three characters so those periods align; a provider-named window too
+long for that column keeps a plain row instead of a truncated bar. Meters size
+to the connected Herdr endpoint's sidebar — indent and scrollbar included.
+Empty fields collapse; percentages can show remaining or used quota. Cache and
+TTL are off by default (turn them on in settings if you want them). Login-scoped
+vendors (Grok, Codex, Devin, OpenCode, Cursor) keep every tab visible in the
+Agent panel; duplicate 5h/7d/30d rows collapse to one pane per Space. On a
+wide sidebar, the vendor icon and name sit above that pane's quota, and extra
+tabs list model, topic, and context with no icon. A settings row gap of 1 still
+separates different agents; nested extra tabs of the same vendor stay flush.
+Claude and Agy stay per-pane.
+Agent order defaults to Space grouping with least quota left first inside each space.
+Low-quota notifications stay off until you set a threshold. Switch layout,
+fields, and percentages from the settings pane (`prefix+shift+q`).
 
-Requires Herdr 0.8.0+ (0.8.2+ on Windows), Rust 1.95+, and at least one
-supported agent CLI. `install.sh` is for macOS and Linux; on Windows build
-and link the plugin yourself (see below).
+## Install and upgrade
+
+Requires **Herdr 0.9.0+**, the Rust toolchain pinned in `rust-toolchain.toml`,
+macOS, Linux, or Windows, and a supported agent CLI. `install.sh` is for
+macOS and Linux; on Windows build and link the plugin yourself (see below).
 
 ```sh
-git clone https://github.com/levi-qiao/herdr-agent-quota.git
-cd herdr-agent-quota
+git clone https://github.com/levi-qiao/herdr-agent-usage.git
+cd herdr-agent-usage
 ./install.sh
 ```
 
-Restart already-running agent panes once. To install only a subset:
+The GitHub repository and Herdr plugin id are both `herdr-agent-usage`.
+`./install.sh` adopts an existing `herdr-agent-quota` install even when Herdr
+has already switched the linked id, then unlinks the old id. The first launch
+of the new binary adopts the same directories. Run `./install.sh` after
+pulling so the Cursor hook command is rewritten; until then the previous hook
+script keeps running.
+
+To enable a subset, use `./install.sh --agent claude,codex,omp`.
+Existing sessions need restarting only when newly installed hooks or Herdr
+integrations must be loaded.
+
+The script builds, links, and runs `configure`. It does not finish icons in
+every terminal, Herdr integrations, or macOS Keychain approval. To have a
+coding agent on this machine complete that, paste the prompt in [Ask an agent
+to finish setup](#ask-an-agent-to-finish-setup).
+
+Upgrade from the repository directory:
 
 ```sh
-./install.sh --agent claude,codex,omp
+git pull --ff-only
+./install.sh
 ```
 
 ### Windows
 
-Herdr 0.8.2+ runs natively on Windows and so does this plugin: the manifest
-commands are plain argv (no `sh` needed), home paths resolve through `HOME`
-first and `USERPROFILE` otherwise, statusLine commands run through
-`cmd /S /C`, Herdr's config is read from `%APPDATA%\herdr`, and the Agent
+The plugin runs natively on Windows: the manifest commands are plain argv
+(no `sh` needed), home paths resolve through a Windows `HOME` first and
+`USERPROFILE` otherwise, statusLine wrappers pass the state directory as
+`--state-dir` so they work under Git Bash (which Claude Code uses) and
+`cmd.exe` alike, Herdr's config is read from `%APPDATA%\herdr`, and the Agent
 panel ordering speaks Herdr's named-pipe socket. Build, link, configure:
 
 ```powershell
-git clone https://github.com/levi-qiao/herdr-agent-quota.git
+git clone https://github.com/ivanvykopal/herdr-agent-quota.git
 cd herdr-agent-quota
 cargo build --release
 herdr plugin link . --enabled
-herdr plugin action invoke configure --plugin herdr-agent-quota
+herdr plugin action invoke configure --plugin herdr-agent-usage
 ```
 
 `herdr plugin link` does not run the build step, so build first. The
 `configure` action installs the sidebar rows, keybindings, and collectors,
-then reloads the running server. For a subset, pass options through the
-plugin config directory exactly as `install.sh` does on Unix, or run
-`.\target\release\herdr-agent-quota.exe configure --agent claude,codex --apply`
-directly.
+reloads the running server, and refreshes quota.
 
+Upgrades retain saved preferences, repair managed configuration, refresh quota,
+and restore background updates automatically. No cache deletion or watcher
+management is required. Changes to the Herdr server connection are adopted by
+the watcher automatically.
 
-`install.sh` only rewrites the shared `ui.sidebar.agents.rows` array when it is
-empty, contains only rows already managed by the plugin, or matches Herdr's
-default `["state_icon", "agent"]` row. Existing rows from another plugin or the
-user are preserved, while `rows_by_agent` for the selected agents is still
-added or updated.
+## Ask an agent to finish setup
 
-Supported values: `all`, `claude`, `codex`, `grok`, `agy`, `opencode`, `pi`, `omp`, `devin`.
+`./install.sh` is not the whole job: brand icons need a font map in **this**
+terminal, most agents need a Herdr integration, and Cursor/Muse on macOS need
+a one-time Keychain **Always Allow**. Paste the following into Claude, Cursor,
+Grok, Codex, or any coding agent **on the machine that runs Herdr**. The same
+steps, with commands, are in [docs/agent-setup.md](docs/agent-setup.md)
+([中文](docs/agent-setup.zh-CN.md)).
+
+```
+Install and fully configure herdr-agent-usage on this computer until Herdr's
+Agent sidebar shows brand icons and quota for the agent CLIs I actually have.
+Stopping after ./install.sh is not done. Icons as boxes or "?" are unfinished.
+
+Repo: https://github.com/levi-qiao/herdr-agent-usage
+If this working tree is already that repo, use it; otherwise clone it, cd in,
+and follow docs/agent-setup.md (English) or docs/agent-setup.zh-CN.md (中文).
+If you cannot read those files, do all of the following anyway.
+
+Rules:
+- Do not herdr pane read (especially --source recent). That repaints agent TUIs.
+- Do not call a bare `agent` binary (that is Grok when both are installed).
+  Cursor's CLI is `cursor` or `cursor-agent`.
+- Do not install a Cursor statusLine; it replaces the native footer.
+- Plugin actions ignore extra env vars. Pass choices as ./install.sh flags.
+- Use rustup for rust-toolchain.toml. Do not brew-install rust.
+
+1. PATH: add ~/.local/bin, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin.
+   Need herdr 0.9.0+ and rustup/cargo. If herdr is missing, stop. If cargo is
+   missing, install rustup (https://rustup.rs), not a distro Rust package.
+
+2. Detect agents as the union of binaries, config dirs, and `herdr agent list`.
+   --agent names: claude (claude, ~/.claude), codex (codex, ~/.codex),
+   grok (grok, ~/.grok), agy (agy, ~/.gemini/antigravity-cli),
+   opencode (opencode, ~/.config/opencode), pi (pi, ~/.pi/agent),
+   omp (omp, ~/.omp), devin (devin, ~/.local/share/devin),
+   muse (muse or muse-code, ~/.config/muse),
+   cursor (cursor or cursor-agent, ~/.cursor).
+   Print the list. If none, install all and say so.
+
+3. From the repo: git pull --ff-only if this is main and clean; then
+   ./install.sh --agent <detected,comma,separated>
+   Read the full output. font: notes and missing integrations are remaining work.
+
+4. After the script:
+   - herdr plugin list must show herdr-agent-usage enabled.
+   - Wait for configure/refresh logs to succeed (invoke returns while running).
+   - herdr integration status; for each detected agent that is "not installed",
+     herdr integration install <id> (claude, codex, grok, opencode, pi, omp,
+     devin, cursor — not agy or muse). Skip CLIs the user does not have.
+   - Font: configure copies Herdr Agent Icons Max to ~/Library/Fonts (macOS) or
+     ~/.local/share/fonts (Linux) and maps Ghostty/kitty only if those configs
+     already exist. Linux: fc-cache that fonts dir. Detect THIS terminal
+     (TERM_PROGRAM / KITTY_WINDOW_ID / WEZTERM_EXECUTABLE). PUA U+E1A0–U+E1B6
+     needs an explicit map or the cell is a box or "?". Ghostty:
+     font-codepoint-map = U+E1A0-U+E1B6="Herdr Agent Icons Max" (and U+E1C0–U+E1C5),
+     wrapped in "# BEGIN/END herdr-agent-usage font". kitty: symbol_map those
+     ranges to Herdr Agent Icons Max. WezTerm: add the family to font_with_fallback.
+     VS Code/Cursor: append it to terminal.integrated.fontFamily. Then reload
+     the terminal (Ghostty cmd+shift+,, kitty ctrl+shift+f5). Muse's mark is ◈
+     on purpose. Nested extra tabs of the same vendor have no icon by design.
+     Yellow "?" on 1.6.1+ is almost always an unmapped terminal; older builds
+     used ZWNJ — upgrade.
+   - macOS Cursor: if ~/.cursor/cli-config.json has authInfo and
+     ~/.cursor/.herdr-keychain-approved is missing, warn the user, then
+     ./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+     and tell them to click Always Allow (not Allow).
+   - macOS Muse keychain login: same with --provider muse.
+   - herdr plugin action invoke refresh --plugin herdr-agent-usage and wait.
+   - Tell me which already-running panes to restart (new hooks/integrations).
+     Claude/Agy need one turn for StatusLine. Cursor cache needs a turn after
+     hooks.json is reloaded.
+
+5. Report: detected vs enabled agents, integrations, font path and which
+   terminal you mapped, Keychain, restarts still needed, anything still broken.
+   Do not claim icons are correct without a human look or a verified font map.
+```
 
 ## Settings
 
-Press `prefix+shift+q`, or run:
+Press `prefix+shift+q`, or run the following if that key is already assigned:
 
 ```sh
-herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
+herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 ```
 
-Herdr 0.8 does not expose extension points for its built-in Settings tabs or
-bottom-right menu. The plugin therefore opens its own managed popup. A key
-conflict is preserved rather than overwritten; use the command above instead.
+<img src="docs/screenshots/settings.png" alt="Agent quota settings" width="760">
 
-<img src="docs/screenshots/settings.png" alt="Agent quota settings pane" width="760">
-
-| Control | Values | Effect |
-| --- | --- | --- |
-| Percentages | `remaining`, `used` | Changes the number; colors still mean remaining headroom. |
-| Sidebar layout | `packed`, `stacked` | Joins related fields or gives each field a row. |
-| Row gap | `0`, `1` | Controls spacing between Agent cards. |
-| Watch interval | 30s–1h | Refresh cadence while an agent is working. |
-| Brand colors | `on`, `off` | Colors provider/model names; severity colors remain. |
-| Agent order | `default`, `quota` | Optionally puts the lowest-headroom agent first. |
-| Low quota alert | `off`, 5–50% | Notifies once when a provider crosses the threshold. |
-| Fields | topic, model, cache, TTL, context, short/long quota | Hides optional dimensions. |
-| Agents | eight supported harnesses | Installs or removes collectors and sidebar rows. |
-
-Use `↑/↓` to move, `←/→` or Space to change, `a` to apply, and `q` to close.
-A `*` means there are unapplied changes.
-
-The same settings are scriptable:
-
-```sh
-./install.sh \
-  --agent all \
-  --sidebar-layout packed \
-  --row-gap 1 \
-  --quota-percent remaining \
-  --fields all \
-  --brand-colors on \
-  --agent-order quota \
-  --low-quota-alert 10 \
-  --watch-interval-seconds 60
-```
-
-Manual refresh and uninstall:
-
-```sh
-herdr plugin action invoke refresh --plugin herdr-agent-quota
-./uninstall.sh
-```
-
-## What is displayed
-
-| Dimension | Source and behavior |
+| Setting | Options |
 | --- | --- |
-| Provider / model | Exact route and active model for the pane's session. Devin uses `sessions.db` when that pane's session id is present, otherwise `config.json` `agent.model`. |
-| Topic | Current visible user prompt; the previous topic survives when it scrolls away. |
-| Context | Used percentage of the active model's context window. |
-| Cache | Session cache hit rate when the agent exposes trustworthy counters. |
-| Cache TTL | Recorded expiry when available; `ttl≈` marks a documented estimate. |
-| Quota | Remaining or used percentage plus reset ETA, scoped to the serving account. |
-| Headroom | Tightest visible quota, used by optional sorting and notifications. |
+| Percentages | Remaining or used; colors always indicate remaining headroom |
+| Layout | `gauges` (default) adds a meter beside each quota number; `packed` groups related fields; `stacked` gives each field a row |
+| Row gap | Zero or one blank line between agents |
+| Watch interval | 30 seconds–1 hour; default 60 seconds |
+| Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
+| Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
+| Low quota alert | Off or a threshold from 1% to 100% |
+| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor |
 
-| Agent | Quota support | Session diagnostics |
+Use arrows or Space to edit, `a` to apply, and `q` to close.
+Installer options are also available through `./install.sh --help`.
+
+## Data sources and limits
+
+| Agent | Quota source | Attribution |
 | --- | --- | --- |
-| Claude Code | 5h + 7d | model, context, cache, recorded prompt-cache expiry |
-| OpenAI Codex | 5h + 7d (paid); 30d on the ChatGPT free plan | model, context, cache, estimated 30m cache TTL, summary |
-| Grok CLI | 7d or 30d | model, context, cache |
-| Agy / Antigravity | 5h + 7d | statusLine model, context, cache |
-| OpenCode | OpenCode Go 5h + 7d; 30d in dashboard | exact local session model/context |
-| Pi | Canonical Codex quota on an exact account match | model, context, cache, supported TTL data |
-| omp (oh-my-pi) | OMP-normalized windows such as `5h`, `1d`, `7d`, `Monthly` | model, context, cache, supported TTL data |
-| Devin CLI | 1d + 7d | Per-session model from `~/.local/share/devin/cli/sessions.db` (`id`, `model`), mapped through local `devin-models.json`. A session not in the DB uses `config.json` `agent.model`. Not the API `planName`. |
+| Codex | Codex app-server; 5h and/or 7d | Current login in the plugin's `CODEX_HOME` |
+| Grok | CLI billing endpoint; 7d or 30d | Current CLI credentials |
+| Devin | CLI usage endpoint; 1d and 7d | Current CLI credentials |
+| Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
+| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the macOS Keychain login from `cursor-agent login`, else `$CURSOR_STATE_DB` (`state.vscdb` access token) when the CLI has no login; model from local session files; topic from the generated session title; `cx` from `store.db` `token_details` (the CLI footer percent); cache from CLI hooks |
+| Claude Code | StatusLine; 5h and 7d | Exact session observation |
+| Agy / Antigravity | StatusLine; 5h, 7d, and api (third-party pool on Gemini) | Exact session and identifiable model pool |
+| OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
+| Pi | Canonical Codex quota | Only when the recorded account matches |
+| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
 
-OMP is a generic adapter, not a second set of provider adapters. The plugin runs
-`omp usage --json --provider <id>`, retains OMP's window labels, and attributes
-the result with the session's `credential_pin`. It never opens OMP's credential
-database or reinterprets Google, Anthropic, or OpenAI periods. OMP's five-minute
-usage cache remains authoritative; this plugin adds a one-minute process debounce.
+The Claude Code status line keeps the user's own statusLine output and appends
+a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
+minus the share of the window's clock already run, in points. `↓` means slow
+down, `↑` means there is headroom, `=` is within five points. The window with
+the least remaining quota is paced and named; if that window cannot be paced,
+nothing is appended rather than pacing the looser one: no reset time, expired,
+reset further away than the window is long, or in the first 5% of the window.
 
-The sidebar has short and long quota rows. OMP's common windows occupy those rows
-while retaining their labels; one normalized window is shown per row.
+Quota windows retain their provider's meaning. Model, context, and cache data
+come from the identified session when available. `ttl≈` marks an estimated
+prompt-cache lifetime, not a guaranteed expiry. Topic extraction uses the
+named pane's visible screen for most agents and preserves the last topic when
+it scrolls away. Cursor and Grok use the generated session title from local
+session metadata instead; Muse uses the last prompt in its transcript.
 
-## Herdr integrations
+All supported working agents participate in one background watcher. Requests
+are debounced for 60 seconds, including a final refresh after a turn settles.
+OMP additionally retains its own five-minute usage cache. Idle panes sharing a
+verified quota source receive the same reading.
 
-Herdr must report the exact session before local model, context, and account data
-can be attributed:
-
-```sh
-herdr integration status
-```
-
-Enabling OMP automatically installs `herdr integration omp` when it is missing.
-Restart an already-running OMP pane afterward because integrations load at agent
-startup. Other missing integrations can be repaired directly:
-
-```sh
-herdr integration install opencode
-herdr integration install pi
-herdr integration install omp
-herdr integration install devin
-```
+Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
+not separate accounts for each pane. Claude/Agy do not report a reliable serving
+account ID, so their observations are not shared across sessions. Unknown
+identity or model-pool attribution does not produce a guessed quota. Failed
+requests preserve the last verified reading for that same account; they do not
+turn failures into zero usage.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| OpenCode, Pi, OMP, or Devin is blank | Run `herdr integration status`, install the missing integration, then restart that pane. |
-| Devin has no quota | Confirm `~/.local/share/devin/credentials.toml` (or `$DEVIN_CREDENTIALS_FILE`) contains `windsurf_api_key`. |
-| OMP has model/context but no quota | Run `omp usage --json --redact --provider <id>` and confirm a report exists. |
-| Herdr cannot execute OMP | Put `omp` on the server's `PATH`, or set `HERDR_AGENT_QUOTA_OMP_BIN`. |
-| Claude or Agy shows `N/A` | Send one turn so its statusLine emits a snapshot. |
-| Rows do not appear | Run `herdr plugin action invoke configure --plugin herdr-agent-quota`, then restart affected panes. |
-| A value survives a provider outage | Expected: the same account's last good snapshot is retained. |
-| Packed rows are truncated | Switch to `stacked`; Herdr does not wrap sidebar tokens. |
-
-## Safety
-
-- No prompt or model request is generated.
-- Events read only their named pane with `--source visible`; refresh and watch do not read panes.
-- Credentials remain in the owning CLI. Snapshots hold sanitized usage and hashed attribution only.
-- OMP's `agent.db` is never opened; quota comes only from OMP CLI output.
-- Devin quota uses the CLI's `GetUserStatus` contract. The API key is hashed for account identity and never stored.
-- Metadata is written only when a token changes and remains within Herdr's 16-token limit.
-
-## Development
+| Brand icons are boxes or `?` | The icon font is missing or this terminal has no U+E1A0–U+E1B6 map — see [Ask an agent to finish setup](#ask-an-agent-to-finish-setup). Reload the terminal after `configure`. A yellow `?` on a build older than 1.6.1 was the working-state ZWNJ bug; upgrade. Muse uses the text mark `◈` on purpose. Nested extra tabs of the same vendor have no icon by design. |
+| Session data is missing | Run `herdr integration status`; load missing integrations before restarting the affected agent |
+| Claude/Agy quota is missing | Send a turn so the session's StatusLine produces an observation |
+| OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
+| Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
+| Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-usage refresh --provider muse --keychain-approve` and click **Always Allow** |
+| Cursor quota is missing or stuck on a previous account | Run `cursor login`. On macOS, `cursor-agent login` stores the token in Keychain: run `herdr-agent-usage refresh --provider cursor --keychain-approve` and click **Always Allow**. The desktop app token is only used when the CLI has no login of its own **and** `$CURSOR_STATE_DB` is set |
+| Ghostty asks to "access data from other apps" while using Cursor | macOS `SystemPolicyAppData`: a Ghostty child touched Cursor-owned files (`~/.cursor` or Application Support). This plugin does not open those trees on macOS unless `$CURSOR_HOME` / `$CURSOR_AUTH_FILE` / `$CURSOR_STATE_DB` is set. Cursor CLI itself may still prompt (it writes under `~/Library/Caches`). Click **Allow**, or grant Ghostty Files & Folders / Full Disk Access. **Don't Allow** makes later reads fail closed. Reload the plugin after upgrading so the watcher is the new binary. |
+| Cursor cache/context is missing | `cx` comes from that session's `store.db`; cache still needs the pane to have reloaded `hooks.json` and sent a turn (headless `--print` does not fire those hooks) |
+| Rows are missing | Run the configure action below to repair managed configuration |
+| The `gauges` meter disappears on a narrow sidebar | Expected below ~24 columns; widen the sidebar and refresh |
+| `gauges` still uses the old width after a resize | Refresh with `prefix+shift+r`; there is no live resize publish path |
+| Cache details stay on two lines under `gauges` | Widen the sidebar until the combined row fits |
 
 ```sh
-cargo fmt --all -- --check
-cargo test --all-targets --all-features --locked
-cargo clippy --release --all-targets --all-features --locked -- -D warnings
-cargo build --release --locked
+herdr plugin action invoke refresh --plugin herdr-agent-usage
+herdr plugin action invoke configure --plugin herdr-agent-usage
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
-[CHANGELOG.md](CHANGELOG.md).
+Uninstall everything with `./uninstall.sh`, or remove a subset with
+`./uninstall.sh --agent grok`. Configuration changes are reversible; user-owned
+settings and other agents remain intact.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and validation,
+[SECURITY.md](SECURITY.md) for data handling and vulnerability reports, and
+[CHANGELOG.md](CHANGELOG.md) for release notes. Dated investigations are indexed
+in [docs/README.md](docs/README.md).
 
 ## License
 
-MIT. Not affiliated with Herdr, OpenAI, Anthropic, xAI, Google, OpenCode, or Cognition.
+[MIT](LICENSE). Not affiliated with Herdr or the supported AI providers.

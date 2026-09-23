@@ -3,17 +3,39 @@ use clap::Parser;
 use herdr_agent_quota::cli::{Cli, Command};
 
 fn main() -> Result<()> {
+    herdr_agent_quota::identity::adopt_alias_plugin_dirs();
     let cli = Cli::parse();
     match cli.command {
         Command::Refresh {
             provider,
             force,
             json,
-        } => herdr_agent_quota::refresh::run(&provider.providers(), force, json),
+            keychain_approve,
+        } => {
+            if keychain_approve {
+                let providers = provider.providers();
+                let muse = providers.contains(&herdr_agent_quota::model::Provider::Muse);
+                let cursor = providers.contains(&herdr_agent_quota::model::Provider::Cursor);
+                if !muse && !cursor {
+                    anyhow::bail!(
+                        "--keychain-approve only applies to muse or cursor; run `refresh --provider cursor --keychain-approve`"
+                    );
+                }
+                if muse {
+                    herdr_agent_quota::providers::muse::set_keychain_approve_attempt();
+                }
+                if cursor {
+                    herdr_agent_quota::providers::cursor::set_keychain_approve_attempt();
+                }
+                return herdr_agent_quota::refresh::run(&providers, force, json);
+            }
+            herdr_agent_quota::refresh::run(&provider.providers(), force, json)
+        }
         Command::Watch {
             provider,
             interval_seconds,
-        } => herdr_agent_quota::refresh::watch(&provider.providers(), interval_seconds),
+            defer,
+        } => herdr_agent_quota::refresh::watch(&provider.providers(), interval_seconds, defer),
         Command::Startup { provider } => herdr_agent_quota::refresh::startup(&provider.providers()),
         Command::Event => herdr_agent_quota::refresh::event(),
         Command::Focus => herdr_agent_quota::refresh::focus(),
@@ -49,12 +71,17 @@ fn main() -> Result<()> {
                     low_quota_alert,
                 },
             );
-            // The plugin's configure action used to chain
-            // `&& herdr server reload-config` through a shell. The command
-            // is platform-neutral argv now, so the reload lives here and
-            // only fires under a Herdr-provided binary.
+            // The plugin's configure/uninstall actions used to chain
+            // `&& herdr server reload-config [&& ... startup]` through `sh`.
+            // The manifest is platform-neutral argv now, so the follow-ups
+            // live here and only fire under a Herdr-provided binary.
             if result.is_ok() && (apply || uninstall) {
                 herdr_agent_quota::herdr::reload_server_config()?;
+                if apply && std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_some() {
+                    herdr_agent_quota::refresh::startup(
+                        &herdr_agent_quota::cli::ProviderSelection::All.providers(),
+                    )?;
+                }
             }
             result
         }
@@ -67,6 +94,7 @@ fn main() -> Result<()> {
             use_state_dir(state_dir);
             herdr_agent_quota::configure::agy::run_statusline_hook()
         }
+        Command::CursorHooks => herdr_agent_quota::configure::cursor::run_hook(),
     }
 }
 
