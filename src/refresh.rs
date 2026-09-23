@@ -1,7 +1,7 @@
 use crate::cache::CacheStore;
 use crate::cli::{AgentSelection, LowQuotaAlert};
 use crate::herdr::{
-    current_focused_pane, find_agent_icon_panes, find_agent_pane, focused_pane_in_snapshot,
+    IdleAge, current_focused_pane, find_agent_icon_panes, find_agent_pane, focused_pane_in_snapshot,
     list_agent_panes, list_agent_state, plugin_quota_present, publish_icon_tokens,
     publish_pane_tokens, publish_pane_tokens_with_scrolled_icons, publish_status_icons,
     refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
@@ -194,6 +194,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             && settling.is_empty()
             && !stale_icons
             && cache.icon_attention().unseen.is_empty()
+            && !idle_age_pending(&state.panes)
         {
             break;
         }
@@ -552,6 +553,7 @@ fn apply_icon_attention(
         attention.working.retain(|id| live.contains(id));
         attention.unseen.retain(|id| live.contains(id));
         attention.seen.retain(|id| live.contains(id));
+        attention.last_active.retain(|id, _| live.contains(id));
     }
     if hydrate {
         for pane in panes.iter() {
@@ -632,7 +634,36 @@ fn apply_icon_attention(
     if let Some(pane_id) = force_seen {
         attention.last_focused = Some(pane_id.to_owned());
     }
+    record_idle_age(panes, &mut attention.last_active, CacheStore::now_unix());
     cache.set_icon_attention(&attention)
+}
+
+/// Stamp working panes as active now and give idle panes their tier.
+///
+/// A pane with no record is stamped on first sight: the plugin cannot know
+/// how long it sat idle before, and guessing "stale" would dim a pane the
+/// user just opened.
+fn record_idle_age(panes: &mut [AgentPane], last_active: &mut BTreeMap<String, u64>, now: u64) {
+    for pane in panes.iter_mut() {
+        if matches!(
+            pane.status,
+            AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done
+        ) {
+            last_active.insert(pane.pane_id.clone(), now);
+            pane.idle_age = IdleAge::Recent;
+            continue;
+        }
+        let since = *last_active.entry(pane.pane_id.clone()).or_insert(now);
+        pane.idle_age = IdleAge::for_idle_seconds(now.saturating_sub(since));
+    }
+}
+
+/// Whether an idle pane will cross into a later tier while a watcher that
+/// is still allowed to run could republish it.
+fn idle_age_pending(panes: &[AgentPane]) -> bool {
+    panes.iter().any(|pane| {
+        !pane.working() && pane.status != AgentStatus::Blocked && pane.idle_age != IdleAge::Stale
+    })
 }
 
 fn paint_focus_icons(cache: &CacheStore, force_idle_id: Option<&str>) -> Result<()> {
@@ -1852,8 +1883,42 @@ fn tokens_for_loaded_snapshot(
 mod tests {
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
+    use crate::herdr::IdleAge;
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
     use tempfile::tempdir;
+
+    #[test]
+    fn idle_age_tiers_follow_the_last_turn_and_a_new_turn_resets_them() {
+        let mut pane = test_pane("w1:p1", Harness::Claude);
+        let mut last_active = BTreeMap::new();
+        pane.status = AgentStatus::Working;
+        record_idle_age(std::slice::from_mut(&mut pane), &mut last_active, 1_000);
+        assert_eq!(pane.idle_age, IdleAge::Recent);
+
+        pane.status = AgentStatus::Idle;
+        for (elapsed, want) in [
+            (crate::herdr::IDLE_AFTER_SECONDS - 1, IdleAge::Recent),
+            (crate::herdr::IDLE_AFTER_SECONDS, IdleAge::Idle),
+            (crate::herdr::STALE_AFTER_SECONDS, IdleAge::Stale),
+        ] {
+            record_idle_age(std::slice::from_mut(&mut pane), &mut last_active, 1_000 + elapsed);
+            assert_eq!(pane.idle_age, want, "after {elapsed}s");
+        }
+
+        pane.status = AgentStatus::Working;
+        record_idle_age(std::slice::from_mut(&mut pane), &mut last_active, 99_999);
+        pane.status = AgentStatus::Idle;
+        record_idle_age(std::slice::from_mut(&mut pane), &mut last_active, 99_999);
+        assert_eq!(pane.idle_age, IdleAge::Recent);
+    }
+
+    #[test]
+    fn a_pane_with_no_record_starts_recent_instead_of_stale() {
+        let mut pane = test_pane("w1:p9", Harness::Codex);
+        let mut last_active = BTreeMap::new();
+        record_idle_age(std::slice::from_mut(&mut pane), &mut last_active, 5_000_000);
+        assert_eq!(pane.idle_age, IdleAge::Recent);
+    }
 
     fn test_pane(id: &str, harness: Harness) -> AgentPane {
         AgentPane {
@@ -1868,6 +1933,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         }
     }
 

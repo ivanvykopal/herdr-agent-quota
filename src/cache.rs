@@ -48,6 +48,10 @@ pub struct IconAttention {
     pub seen: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_focused: Option<String>,
+    /// Unix time each pane last worked (or was first seen idle), for the
+    /// idle-age tiers. Pruned with the other sets to live panes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_active: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]

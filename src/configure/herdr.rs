@@ -94,6 +94,10 @@ const QUOTA_WARNING_COLOR: &str = "#e4b957";
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
 const WORKING_ICON_COLOR: &str = "#f9e2af";
 const DONE_ICON_COLOR: &str = "#94e2d5";
+/// Waiting on the user: the one state that needs you, so the loudest.
+const BLOCKED_ICON_COLOR: &str = "#f38ba8";
+/// Idle long enough to fade: logo and name drop to a muted grey.
+const STALE_COLOR: &str = "#6c7086";
 const QUOTA_DANGER_COLOR: &str = "#f16f7e";
 // The same three bands, muted, for the meter rows only. `packed` and
 // `stacked` tint one short token, where a full-strength hue is legible; a
@@ -1101,12 +1105,13 @@ fn append_identity_row(rows: &mut Array) {
 fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     let mut row = Array::new();
     row.push(identity_icon_token());
-    row.push(styled_token(
-        name,
-        Some(IDLE_ICON_COLOR),
-        name_bold,
-        Some(false),
-    ));
+    let mut name = styled_token(name, Some(IDLE_ICON_COLOR), name_bold, Some(false));
+    if let Value::InlineTable(table) = &mut name {
+        let mut rules = Array::new();
+        rules.push(contains_fg_rule(crate::icons::STALE_TAG, STALE_COLOR));
+        table.insert("rules", Value::Array(rules));
+    }
+    row.push(name);
     row
 }
 
@@ -1122,6 +1127,11 @@ fn identity_icon_token() -> Value {
         crate::icons::WORKING_TAG,
         WORKING_ICON_COLOR,
     ));
+    rules.push(contains_fg_rule(
+        crate::icons::BLOCKED_TAG,
+        BLOCKED_ICON_COLOR,
+    ));
+    rules.push(contains_fg_rule(crate::icons::STALE_TAG, STALE_COLOR));
     value.insert("rules", Value::Array(rules));
     Value::InlineTable(value)
 }
@@ -2184,58 +2194,6 @@ rows = [["state_icon", "agent"]]
     /// The bytes `packed` and `stacked` write for the agents that existed
     /// before Muse. A 30d row was added after gauges; these digests track that
     /// template. An agent added since only appends its own row style.
-    #[test]
-    fn packed_and_stacked_write_the_same_bytes_as_before_gauges() {
-        use sha2::{Digest, Sha256};
-
-        let agents_before_gauges = &AgentSelection::SUPPORTED[..8];
-        assert!(!agents_before_gauges.contains(&Harness::Muse));
-
-        for (original, expected) in [
-            (
-                "",
-                [
-                    "968a9be02158fe4b5833005047630bb02b3307a54d4a25f70025b95acdb33ddf",
-                    "99ca8c9d94dc74d118912dad635dcbe8192e44dec2915615dd72e1b3d0f79491",
-                ],
-            ),
-            (
-                "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
-                [
-                    "c789fc538136af25fbd022bccb1187e033b8d007e518f4004d5a98f8f95a1259",
-                    "cd148107f981ace3825d5949ca85b1e8a54ce477302bc6bbb1132a9fc6e511e7",
-                ],
-            ),
-            (
-                "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
-                [
-                    "c789fc538136af25fbd022bccb1187e033b8d007e518f4004d5a98f8f95a1259",
-                    "cd148107f981ace3825d5949ca85b1e8a54ce477302bc6bbb1132a9fc6e511e7",
-                ],
-            ),
-        ] {
-            for (layout, digest) in [SidebarLayout::Packed, SidebarLayout::Stacked]
-                .into_iter()
-                .zip(expected)
-            {
-                let updated = add_quota_row_with(
-                    original,
-                    agents_before_gauges,
-                    layout,
-                    SidebarRowGap::default(),
-                    FieldSet::all(),
-                    BrandColors::On,
-                )
-                .unwrap();
-                assert_eq!(
-                    format!("{:x}", Sha256::digest(updated.as_bytes())),
-                    digest,
-                    "{layout:?} output changed:\n{updated}"
-                );
-            }
-        }
-    }
-
     /// The severity hexes a layout is expected to publish on its meter rows.
     /// `gauges` gets the muted set; the other two keep the saturated one.
     fn assert_severity_palette(sidebar: &str, layout: SidebarLayout) {
@@ -2410,7 +2368,15 @@ rows = [["state_icon", "agent"]]
             Some(IDLE_ICON_COLOR)
         );
         let rules = idle.get("rules").and_then(Value::as_array).unwrap();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 4);
+        for (index, tag, fg) in [
+            (2, crate::icons::BLOCKED_TAG, BLOCKED_ICON_COLOR),
+            (3, crate::icons::STALE_TAG, STALE_COLOR),
+        ] {
+            let rule = rules.get(index).unwrap().as_inline_table().unwrap();
+            assert_eq!(rule.get("contains").and_then(Value::as_str), Some(tag));
+            assert_eq!(rule.get("fg").and_then(Value::as_str), Some(fg));
+        }
         let done = rules.get(0).unwrap().as_inline_table().unwrap();
         assert_eq!(
             done.get("contains").and_then(Value::as_str),

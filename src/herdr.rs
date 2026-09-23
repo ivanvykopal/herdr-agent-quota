@@ -269,6 +269,62 @@ pub struct AgentPane {
     /// Herdr `focused` describes the current pane, not whether a completion
     /// was acknowledged by a later focus event.
     pub focused: bool,
+    /// How long an idle pane has gone without a turn; set by the refresh
+    /// path from the plugin's own activity record, never by Herdr.
+    pub idle_age: IdleAge,
+}
+
+/// Idle tiers by time since the pane last worked. `Recent` is also the
+/// answer for a pane this plugin has no activity record for yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdleAge {
+    #[default]
+    Recent,
+    Idle,
+    Stale,
+}
+
+/// Idle this long shows the ring.
+pub const IDLE_AFTER_SECONDS: u64 = 10 * 60;
+/// Idle this long also fades the row.
+/// Kept under the watcher's one-hour cap so the fade lands while the watcher
+/// that saw the last turn is still polling.
+pub const STALE_AFTER_SECONDS: u64 = 45 * 60;
+
+impl IdleAge {
+    pub fn for_idle_seconds(seconds: u64) -> Self {
+        if seconds >= STALE_AFTER_SECONDS {
+            Self::Stale
+        } else if seconds >= IDLE_AFTER_SECONDS {
+            Self::Idle
+        } else {
+            Self::Recent
+        }
+    }
+}
+
+/// The mark in front of the logo and the invisible colour tag after it.
+///
+/// Shape and colour both carry the state, so the row reads without colour:
+/// spinner working, `?` waiting on you, `✓` done until focused, `○` idle.
+pub fn state_mark(status: AgentStatus, idle_age: IdleAge, now_unix: u64) -> (char, &'static str) {
+    use crate::icons::*;
+    match status {
+        AgentStatus::Working => (working_frame(now_unix), WORKING_TAG),
+        AgentStatus::Done => (DONE_MARK, DONE_TAG),
+        AgentStatus::Blocked => (BLOCKED_MARK, BLOCKED_TAG),
+        AgentStatus::Idle | AgentStatus::Unknown => match idle_age {
+            IdleAge::Recent => (NO_MARK, ""),
+            IdleAge::Idle => (IDLE_MARK, ""),
+            IdleAge::Stale => (IDLE_MARK, STALE_TAG),
+        },
+    }
+}
+
+/// `$quota_icon` without its group indent: mark, a space, logo, tag.
+fn icon_body(harness: Harness, status: AgentStatus, idle_age: IdleAge, now_unix: u64) -> String {
+    let (mark, tag) = state_mark(status, idle_age, now_unix);
+    format!("{mark} {}{tag}", crate::icons::for_harness(harness))
 }
 
 impl AgentPane {
@@ -306,13 +362,13 @@ impl AgentPane {
             .get("quota_icon")
             .map(String::as_str)
             .unwrap_or("");
-        let working = value.contains(crate::icons::WORKING_TAG);
-        let done = value.contains(crate::icons::DONE_TAG);
-        match self.icon_status() {
-            AgentStatus::Working => !working || done,
-            AgentStatus::Done => !done,
-            _ => working || done || value.is_empty(),
-        }
+        let expected = icon_body(
+            self.harness,
+            self.icon_status(),
+            self.idle_age,
+            CacheStore::now_unix(),
+        );
+        !value.ends_with(&expected)
     }
 }
 
@@ -954,6 +1010,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         tokens,
                         status,
                         focused,
+                        idle_age: IdleAge::Recent,
                     });
                 }
             }
@@ -1727,7 +1784,12 @@ fn vendor_nesting(
             heads.insert(head_id.clone());
             header_icon.insert(
                 head_id.clone(),
-                if members.iter().any(|pane| pane.working()) {
+                if members
+                    .iter()
+                    .any(|pane| pane.icon_status() == AgentStatus::Blocked)
+                {
+                    AgentStatus::Blocked
+                } else if members.iter().any(|pane| pane.working()) {
                     AgentStatus::Working
                 } else {
                     AgentStatus::Idle
@@ -1861,7 +1923,6 @@ fn apply_group_and_icon(
     role: VendorRow,
     icon_status: Option<AgentStatus>,
 ) {
-    let glyph = crate::icons::for_harness(pane.harness);
     let space_head = group_heads
         .get(&pane.workspace_id)
         .is_some_and(|head| head == &pane.pane_id);
@@ -1877,17 +1938,29 @@ fn apply_group_and_icon(
             indent_token(desired, "quota_model");
         }
     } else {
-        let mut mark = if member {
-            format!("{GROUP_MEMBER_INDENT}{glyph}")
+        let status = icon_status.unwrap_or_else(|| pane.icon_status());
+        let body = icon_body(pane.harness, status, pane.idle_age, CacheStore::now_unix());
+        // The mark column may be a blank, and Herdr trims leading whitespace
+        // from a value; a ZWSP in front keeps the column for Space heads too.
+        let mark = if member {
+            format!("{GROUP_MEMBER_INDENT}{body}")
         } else {
-            glyph.to_string()
+            format!("\u{200b}{body}")
         };
-        match icon_status.unwrap_or_else(|| pane.icon_status()) {
-            AgentStatus::Working => mark.push_str(crate::icons::WORKING_TAG),
-            AgentStatus::Done => mark.push_str(crate::icons::DONE_TAG),
-            _ => {}
-        }
         desired.insert("quota_icon".to_string(), mark);
+        if status != AgentStatus::Working
+            && status != AgentStatus::Blocked
+            && status != AgentStatus::Done
+            && pane.idle_age == IdleAge::Stale
+        {
+            for name in ["quota_provider_model", "quota_provider"] {
+                if let Some(value) = desired.get_mut(name) {
+                    if !value.ends_with(crate::icons::STALE_TAG) {
+                        value.push_str(crate::icons::STALE_TAG);
+                    }
+                }
+            }
+        }
         desired.remove("quota_icon_working");
         desired.remove("quota_icon_done");
         desired.remove(NEST_GAP_TOKEN);
@@ -2599,6 +2672,65 @@ mod tests {
     }
 
     #[test]
+    fn each_state_has_its_own_mark_and_colour_tag() {
+        use crate::icons::*;
+        assert_eq!(
+            state_mark(AgentStatus::Blocked, IdleAge::Stale, 0),
+            (BLOCKED_MARK, BLOCKED_TAG)
+        );
+        assert_eq!(state_mark(AgentStatus::Done, IdleAge::Recent, 0), (DONE_MARK, DONE_TAG));
+        let (frame, tag) = state_mark(AgentStatus::Working, IdleAge::Stale, 3);
+        assert!(is_working_frame(frame));
+        assert_eq!(tag, WORKING_TAG);
+        assert_eq!(state_mark(AgentStatus::Idle, IdleAge::Recent, 0), (NO_MARK, ""));
+        assert_eq!(state_mark(AgentStatus::Idle, IdleAge::Idle, 0), (IDLE_MARK, ""));
+        assert_eq!(state_mark(AgentStatus::Idle, IdleAge::Stale, 0), (IDLE_MARK, STALE_TAG));
+    }
+
+    #[test]
+    fn a_stale_pane_fades_its_name_and_a_blocked_one_never_does() {
+        let mut pane = AgentPane {
+            pane_id: "w1:p1".to_string(),
+            workspace_id: String::new(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Claude,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+            idle_age: IdleAge::Stale,
+        };
+        let render = |pane: &AgentPane| {
+            let mut desired = BTreeMap::new();
+            desired.insert("quota_provider_model".to_string(), "Claude/Opus".to_string());
+            apply_group_and_icon(
+                &mut desired,
+                pane,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                VendorRow::Flat,
+                None,
+            );
+            desired
+        };
+        let stale = render(&pane);
+        assert!(stale["quota_provider_model"].ends_with(crate::icons::STALE_TAG));
+        assert!(stale["quota_icon"].ends_with(crate::icons::STALE_TAG));
+
+        pane.status = AgentStatus::Blocked;
+        let blocked = render(&pane);
+        assert_eq!(blocked["quota_provider_model"], "Claude/Opus");
+        assert!(blocked["quota_icon"].contains(crate::icons::BLOCKED_TAG));
+        pane.tokens.insert("quota_icon".to_string(), blocked["quota_icon"].clone());
+        assert!(!pane.icon_needs_update(), "a published blocked mark is current");
+        pane.status = AgentStatus::Idle;
+        assert!(pane.icon_needs_update(), "answering the question clears the mark");
+    }
+
+    #[test]
     fn muse_sessions_fill_only_session_less_muse_panes() {
         let pane = |id: &str, harness: Harness, session: Option<&str>| AgentPane {
             pane_id: id.to_string(),
@@ -2615,6 +2747,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let mut panes = vec![
             pane("w1:p1", Harness::Muse, None),
@@ -2698,6 +2831,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let mut desired = BTreeMap::new();
         apply_group_and_icon(
@@ -2725,6 +2859,7 @@ mod tests {
             tokens: BTreeMap::from([(HEADROOM_TOKEN.to_string(), "046".to_string())]),
             status: AgentStatus::Idle,
             focused: true,
+            idle_age: IdleAge::Recent,
         };
         let mut extra = AgentPane {
             pane_id: "w5:pD".to_string(),
@@ -2738,6 +2873,7 @@ mod tests {
             tokens: BTreeMap::from([(HEADROOM_TOKEN.to_string(), "046".to_string())]),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         extra.focused = true;
         extra.status = AgentStatus::Working;
@@ -2791,6 +2927,7 @@ mod tests {
                 tokens: BTreeMap::new(),
                 status: AgentStatus::Idle,
                 focused: false,
+                idle_age: IdleAge::Recent,
             },
             AgentPane {
                 pane_id: "w1:p2".to_string(),
@@ -2804,6 +2941,7 @@ mod tests {
                 tokens: BTreeMap::new(),
                 status: AgentStatus::Idle,
                 focused: false,
+                idle_age: IdleAge::Recent,
             },
         ];
         let nesting = vendor_nesting(&panes, &panes, &[]);
@@ -2825,6 +2963,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Done,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let extra = AgentPane {
             pane_id: "w5:pD".to_string(),
@@ -2838,6 +2977,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let inventory = vec![head.clone(), extra];
         let nesting = vendor_nesting(&inventory, &inventory, &[]);
@@ -2877,6 +3017,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let heads = BTreeMap::from([("w5".to_string(), "w5:p1".to_string())]);
         let mut desired = tokens.clone();
@@ -2958,6 +3099,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let heads = BTreeMap::from([("w5".to_string(), "w5:p1".to_string())]);
         let mut desired = BTreeMap::new();
@@ -2996,6 +3138,7 @@ mod tests {
             ]),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let sibling = AgentPane {
             pane_id: "w1:p2".to_string(),
@@ -3012,6 +3155,7 @@ mod tests {
             ]),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let inventory = vec![head.clone(), sibling.clone()];
         let nesting = vendor_nesting(&inventory, std::slice::from_ref(&sibling), &[]);
@@ -3157,8 +3301,10 @@ mod tests {
         assert!(
             head_desired
                 .get("quota_icon")
-                .is_some_and(|icon| !icon.starts_with('\u{200b}')),
-            "head logo stays bare; Herdr hang-indents the row"
+                // An idle head is ZWSP + blank mark column + logo; a member
+                // prefixes GROUP_MEMBER_INDENT to that same body.
+                .is_some_and(|icon| !icon.starts_with(&format!("{GROUP_MEMBER_INDENT}  "))),
+            "head logo takes no member indent; Herdr hang-indents the row"
         );
         assert_eq!(
             format!("{GROUP_MEMBER_INDENT}x").trim(),
@@ -3225,7 +3371,8 @@ mod tests {
             None,
         );
         let want_head_done = format!(
-            "{}{}",
+            "\u{200b}{} {}{}",
+            crate::icons::DONE_MARK,
             crate::icons::for_harness(Harness::Codex),
             crate::icons::DONE_TAG
         );
@@ -3331,6 +3478,7 @@ mod tests {
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
                     focused: false,
+                    idle_age: IdleAge::Recent,
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
@@ -3344,6 +3492,7 @@ mod tests {
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
                     focused: false,
+                    idle_age: IdleAge::Recent,
                 },
                 AgentPane {
                     pane_id: "w1:p4".to_string(),
@@ -3357,6 +3506,7 @@ mod tests {
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
                     focused: false,
+                    idle_age: IdleAge::Recent,
                 },
             ]
         );
@@ -3656,6 +3806,7 @@ mod tests {
             tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
@@ -3707,6 +3858,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -3758,6 +3910,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -4024,6 +4177,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
@@ -4098,6 +4252,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -4283,6 +4438,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);
@@ -4331,6 +4487,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);

@@ -65,6 +65,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         }
     }
 

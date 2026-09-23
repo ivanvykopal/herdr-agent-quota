@@ -18,6 +18,29 @@ use crate::model::Harness;
 /// icon font has no ZWNJ, and the cell renders as a yellow `?`.
 pub const WORKING_TAG: &str = "\u{2061}";
 pub const DONE_TAG: &str = "\u{2060}";
+/// Waiting on the user (Herdr `blocked`): a question or a permission prompt.
+pub const BLOCKED_TAG: &str = "\u{2062}";
+/// Idle long enough that the row fades. Also rides on the identity name so
+/// the whole identity row dims, not only the logo.
+pub const STALE_TAG: &str = "\u{2063}";
+
+/// State marks drawn in front of the logo, so a row still reads without
+/// colour. Idle-recent draws a blank of the same width so every logo stays
+/// in the same column.
+pub const DONE_MARK: char = '✓';
+pub const BLOCKED_MARK: char = '?';
+pub const IDLE_MARK: char = '○';
+pub const NO_MARK: char = ' ';
+/// Braille spinner for a working pane; the frame advances with each publish.
+pub const WORKING_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+pub fn working_frame(now_unix: u64) -> char {
+    WORKING_FRAMES[(now_unix % WORKING_FRAMES.len() as u64) as usize]
+}
+
+pub fn is_working_frame(mark: char) -> bool {
+    WORKING_FRAMES.contains(&mark)
+}
 
 /// One-cell mark for a harness.
 pub fn for_harness(harness: Harness) -> &'static str {
@@ -66,6 +89,11 @@ mod tests {
             "ZWNJ extends U+E1AB and the icon font draws a replacement ?"
         );
         assert_ne!(WORKING_TAG, DONE_TAG);
+        for tag in [WORKING_TAG, DONE_TAG, BLOCKED_TAG, STALE_TAG] {
+            // U+2060..U+2064 are Format (Cf): Grapheme_Cluster_Break=Control.
+            let code = tag.chars().next().unwrap() as u32;
+            assert!((0x2060..=0x2064).contains(&code), "{code:x}");
+        }
         let marked = format!("{}{WORKING_TAG}", for_harness(Harness::Cursor));
         assert!(marked.starts_with('\u{e1ab}'));
         assert_eq!(marked.chars().count(), 2);

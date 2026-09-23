@@ -188,7 +188,7 @@ fn opencode_context(paths: &OpenCodePaths, session: &SessionEvidence) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{AgentPane, AgentStatus};
+    use crate::herdr::{AgentPane, AgentStatus, IdleAge};
     use crate::model::{CredentialScope, Provider};
     use crate::opencode::{parse_auth_json, AuthReadError, SessionEvidence, SessionLookup};
     use std::collections::BTreeMap;
@@ -212,6 +212,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            idle_age: IdleAge::Recent,
         }
     }
 
